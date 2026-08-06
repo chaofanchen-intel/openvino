@@ -1,0 +1,27 @@
+diff --git a/src/plugins/intel_gpu/src/graph/layout_optimizer.cpp b/src/plugins/intel_gpu/src/graph/layout_optimizer.cpp
+index 5de06f63d8..15f6c2b441 100644
+--- a/src/plugins/intel_gpu/src/graph/layout_optimizer.cpp
++++ b/src/plugins/intel_gpu/src/graph/layout_optimizer.cpp
+@@ -1047,6 +1047,22 @@ void layout_optimizer::set_onednn_dyn_conv_preferred_format(convolution_node& no
+     auto input_channels = get_convolution_channel_count(node, input_layout, true);
+     auto output_channels = get_convolution_channel_count(node, output_layout, false);
+ 
++    // Fully-depthwise convolutions (groups == in_ch == out_ch, e.g. the short
++    // causal conv1d found in state-space / Gated-DeltaNet layers) gain nothing
++    // from a blocked fsv16 layout: each output channel reads exactly one input
++    // channel, so there is zero channel-block reuse in the conv kernel. The only
++    // effect of choosing fsv16 here is a bfyx->blocked reorder before the conv and
++    // a blocked->bfyx reorder after. For a small-kernel depthwise conv (trivial
++    // compute) those two reorders can dominate the op's cost. Keep the planar
++    // format so no reorder is inserted around the conv; the dynamic OCL conv impl
++    // supports bfyx natively.
++    if (input_channels > 0 && static_cast<uint32_t>(input_channels) == node.get_groups() &&
++        input_channels == output_channels) {
++        node.set_preferred_input_fmt(0, format::get_default_format(rank));
++        node.set_preferred_output_fmt(0, format::get_default_format(rank));
++        return;
++    }
++
+     if (i8_u8_input) {
+         // Set default input format for i8/u8 input
+         node.set_preferred_input_fmt(0, get_fsv32_format(rank));

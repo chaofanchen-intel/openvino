@@ -1,0 +1,34 @@
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/activation_opt.cl b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/activation_opt.cl
+index bea3c2c974..4da4644869 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/activation_opt.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/activation_opt.cl
+@@ -5,6 +5,7 @@
+ #include "include/batch_headers/common.cl"
+ 
+ KERNEL(activation)(
++    OPTIONAL_SHAPE_INFO_ARG
+     __global INPUT0_TYPE* input,
+     __global OUTPUT_TYPE* output
+ #if HAS_FUSED_OPS_DECLS
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/activation/activation_kernel_opt.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/activation/activation_kernel_opt.cpp
+index b27174e23e..ea1e98930a 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/activation/activation_kernel_opt.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/activation/activation_kernel_opt.cpp
+@@ -25,6 +25,7 @@ ParamsKey ActivationKernelOpt::GetSupportedKey() const {
+     k.EnableAllOutputLayout();
+     k.EnableTensorOffset();
+     k.EnableBatching();
++    k.EnableDynamicShapesSupport();
+     return k;
+ }
+ 
+@@ -86,6 +87,9 @@ bool ActivationKernelOpt::Validate(const Params& p) const {
+     if (params.outputs[0].GetLayout() != params.inputs[0].GetLayout())
+         DO_NOT_USE_THIS_KERNEL(p.layerID);
+ 
++    if (params.has_dynamic_outputs() && (!params.fused_ops.empty() || !params.inputActivationParams.empty()))
++        DO_NOT_USE_THIS_KERNEL(p.layerID);
++
+     if (!params.fused_ops.empty() &&
+         (params.outputs[0].GetLayout() != DataLayout::bfyx && params.outputs[0].GetLayout() != DataLayout::bfzyx))
+         DO_NOT_USE_THIS_KERNEL(p.layerID);
