@@ -8,8 +8,8 @@ Intel integrated GPUs.
 Optimizations **opt-1 … opt-5** were validated to be **byte-identical** in output (128-token
 greedy-decode `result_md5` multiset unchanged vs. the unpatched baseline). They change
 data layout, GPU work-group dispatch, or graph structure only — never the arithmetic.
-**opt-6 is the one exception** and is held to a weaker (explicitly stated) correctness bar —
-see [Correctness](#correctness).
+**opt-6 and opt-7 are exceptions** and are held to a weaker (explicitly stated) correctness
+bar — see [Correctness](#correctness).
 The patches are generated against this repository's OpenVINO baseline and apply with
 `git apply`.
 
@@ -17,8 +17,9 @@ The patches are generated against this repository's OpenVINO baseline and apply 
 
 | Attention backend | Recommended patches | Why |
 |---|---|---|
-| **PA** (`ATTENTION_BACKEND=PA`, OpenVINO default) | `opt3` + `opt4` + `opt5` + `opt6` | opt-1/opt-2 do not fire under PA; opt-4 raises the causal-conv1d occupancy; opt-5 fixes a remaining dynamic-shape `activation_ref` hotspot; opt-6 removes the two standalone Gated-DeltaNet SiLU passes by fusing them into their producers |
-| **PA, byte-exact required** | `opt3` + `opt4` + `opt5` | opt-6 changes the 128-token greedy decode md5 (see [Correctness](#correctness)) |
+| **PA** (`ATTENTION_BACKEND=PA`, OpenVINO default) | `opt3` + `opt4` + `opt5` + `opt6` + `opt7` | opt-1/opt-2 do not fire under PA; opt-4 raises the causal-conv1d occupancy; opt-5 fixes a remaining dynamic-shape `activation_ref` hotspot; opt-6 removes standalone Gated-DeltaNet SiLU passes; opt-7 removes the RMSNorm-to-DynamicQuantize f16 hand-off |
+| **PA, byte-exact multi-step decode required** | `opt3` + `opt4` + `opt5` | opt-6 and opt-7 change long greedy decode output, although both are bit-exact through prefill/first token |
+| **PA, byte-exact prefill/first token required** | `opt3` + `opt4` + `opt5` + `opt6` + `opt7` | the full stack is bit-exact through prefill and the first token |
 | **SDPA** (`ATTENTION_BACKEND=SDPA`, legacy) | `opt1` + `opt2` + `opt3` | opt-4 targets the PA-only `paged_causal_conv1d` kernel and does not apply |
 
 ## Applying
@@ -29,6 +30,7 @@ git apply qwen3.5_patch/opt3_dynamic_quantize_reuse.patch
 git apply qwen3.5_patch/opt4_conv1d_token_tiled.patch
 git apply qwen3.5_patch/opt5_dynamic_activation_opt.patch
 git apply qwen3.5_patch/opt6_fuse_silu_into_producer.patch   # apply after opt4: shares the conv1d files
+git apply qwen3.5_patch/opt7_fuse_rms_into_dynamic_quantize.patch   # apply after opt3 and opt6
 
 # SDPA (legacy backend)
 git apply qwen3.5_patch/opt1_depthwise_conv_planar.patch
@@ -56,6 +58,7 @@ serial kernel). Set `OV_CONV1D_TOKEN_GROUPS=<n>` to **force** a specific `G`
 | opt-4 | `opt4_conv1d_token_tiled.patch` | PA | `paged_causal_conv1d_ref` low occupancy | `graph/impls/ocl_v2/paged_causal_conv1d_ref.{cl,cpp}` | Token-**tiled** dispatch (`GWS = {seq, hidden, G}`). Each work-item processes one contiguous token tile serially with a sliding window (no redundant reads), reaching full occupancy without extra global-memory traffic. `G` is chosen **adaptively** from the device thread budget (`EU × threads/EU`) and sequence length, so a single patch is portable across device sizes. Bit-exact for any `G ≥ 1` (`G=1` reduces to the original serial kernel) |
 | opt-5 | `opt5_dynamic_activation_opt.patch` | PA **and any dynamic activation using this selector** | Large dynamic-shape `activation_ref` kernels | `kernel_selector/cl_kernels/activation_opt.cl`, `kernel_selector/kernels/activation/activation_kernel_opt.cpp` | Allow simple dynamic-shape activations to use the existing vectorized `activation_opt` float4 kernel instead of the scalar/index-heavy `activation_ref`. The dynamic path is restricted to same-layout activations with no fused ops and no runtime activation-parameter input |
 | opt-6 | `opt6_fuse_silu_into_producer.patch` | PA | Two standalone SiLU (`activation_opt`) passes over the Gated-DeltaNet tensors | `plugin/transformations/move_swish_up_through_reshape.{cpp,hpp}` (new), `plugin/transformations_pipeline.cpp`, `graph/graph_optimizer/prepare_primitive_fusing.cpp`, `graph/impls/ocl_v2/paged_causal_conv1d_ref.{cl,cpp}` | Qwen3.5's two SiLUs each sit one Reshape away from their producer (`PagedCausalConv1D` and the `in_proj_z` FC), and `prepare_primitive_fusing` only fuses into a *direct* dependency — so neither was ever fused, and each ran as a full extra read+write pass over its tensor. A new pass hoists `Swish(Reshape(x))` → `Reshape(Swish(x))` (value-identical), after which the conv1d impl absorbs its SiLU into the kernel epilogue and the FC absorbs its SiLU as a oneDNN `eltwise_swish` post-op |
+| opt-7 | `opt7_fuse_rms_into_dynamic_quantize.patch` | PA and supported DynamicQuantize paths | RMSNorm-to-DynamicQuantize activation traffic | `graph/graph_optimizer/prepare_primitive_fusing.cpp`, `graph/dynamic_quantize.cpp`, `graph/primitive_inst.cpp`, `graph/impls/ocl/dynamic_quantize.cpp`, `kernel_selector/cl_kernels/dynamic_quantize_gpu_opt.cl` | Folds RMSNorm into the DynamicQuantize kernel. The normalized f16 hand-off is kept in registers, rounded to f16 at the original boundary, and then quantized to s8 with scales. |
 
 ### Why opt-1/opt-2 are SDPA-only
 
@@ -117,6 +120,36 @@ holds the value in a register. On a bandwidth-limited integrated GPU those passe
 run at the device's memory-bandwidth ceiling, so they **cannot be made faster — only
 eliminated**. That also explains why opt-6's payoff is device-dependent in the opposite
 direction from opt-4: the tighter the memory subsystem, the more opt-6 is worth.
+
+### opt-7 design rationale: fold RMSNorm into DynamicQuantize
+
+After opt-3 through opt-6, the largest remaining removable boundary was the pair of
+kernels formed by RMSNorm followed immediately by DynamicQuantize. For one `[tokens,
+hidden]` f16 activation, the unfused path performs:
+
+```
+rms:  read x + write normalized f16
+dq:   read normalized f16 + write s8 output and scales
+```
+
+The normalized f16 tensor is only a hand-off. Opt-7 performs the reduction, normalization,
+gamma multiplication, f16 rounding, and quantization in the DynamicQuantize kernel, so the
+intermediate f16 write and read are removed. In the 2B model, 47 of 48 candidate layernorm
+sites fold; layer 0 input layernorm remains unfused because its normalized value has a
+second consumer.
+
+The fused form is intentionally narrow. It requires the supported large-group kernel
+configuration: symmetric i8 quantization, a 128-element group on the last axis, identity
+scale order, no precomputed reduction, a static reduction extent with whole groups, f16
+input/output constraints, and a gamma tensor covering the normalized axis. Unsupported
+configurations stay on the original RMSNorm plus DynamicQuantize path.
+
+The fused reduction follows the standalone RMSNorm reduction structure and rounds the
+normalized value to f16 before quantization. This preserves the prefill/first-token bytes.
+At decode batch 1, the original DynamicQuantize may skip to an f16 pass-through, but a
+folded node cannot skip because its input is not normalized. The folded sites therefore
+quantize during decode, which can change a long greedy sequence even though prefill and the
+first token remain bit-exact.
 
 ## Measured effect
 
@@ -198,6 +231,35 @@ Reading these:
   INT4 dequant makes every GEMM slower; that is a quantization-scheme cost, not something
   a plugin patch can reach.
 
+### opt-7 measured increment on iGPU-C
+
+The following fresh paired A/B runs use the same 1002-token prompt, `n=5`, `ic=1`, and
+four interleaved repetitions. Each value is the median p50 across the repeated runs. The
+three columns distinguish pure model inference, pipeline TTFT, and end-to-end TTFT.
+
+**Per-output-channel INT4 (`group_size=-1`, symmetric):**
+
+| Stage | Infer TTFT (ms) | Pipeline TTFT (ms) | E2E TTFT (ms) |
+|---|---:|---:|---:|
+| opt-3+4+5+6 base | 260.31 | 265.89 | 268.13 |
+| opt-3+4+5+6+opt-7 | 248.97 | 254.60 | 256.77 |
+| **opt-7 delta** | **−11.34 (−4.36%)** | **−11.29 (−4.24%)** | **−11.36 (−4.24%)** |
+
+Per-repetition infer/pipeline/e2e deltas were `−9.82/−9.84/−9.83`,
+`−11.07/−11.05/−11.13`, `−11.44/−11.51/−11.57`, and
+`−11.61/−11.52/−11.58` ms.
+
+**Grouped INT4 (`group_size=128`, asymmetric):**
+
+| Stage | Infer TTFT (ms) | Pipeline TTFT (ms) | E2E TTFT (ms) |
+|---|---:|---:|---:|
+| opt-3+4+5+6 base | 317.37 | 323.05 | 325.25 |
+| opt-3+4+5+6+opt-7 | 317.34 | 322.95 | 325.11 |
+| **opt-7 delta** | **−0.04 (−0.01%)** | **−0.09 (−0.03%)** | **−0.14 (−0.04%)** |
+
+The grouped result is neutral within measurement noise. The per-output-channel opt-7 gain
+must not be generalized to the grouped quantization scheme.
+
 ### SDPA backend (legacy stack: opt-1 + opt-2 + opt-3)
 
 Pure-prefill first-token latency (ms), baseline → +opt-1 → +opt-1+2 → +opt-1+2+3:
@@ -228,7 +290,8 @@ Correctness is judged by the MD5 of the decoded 128-token greedy output: for **o
 opt-5** and every model the MD5 multiset under the patched plugin equals the baseline
 multiset (prefill and 128-token decode both checked). opt-3 additionally preserves the
 decode "skip-to-f16" path, which keeps decode bit-exact after the FCs are made to share one
-DynamicQuantize.
+DynamicQuantize. Opt-6 and opt-7 are bit-exact through prefill/first token but are not
+guaranteed to preserve a long greedy decode byte-for-byte.
 
 ### opt-6 does not meet that bar — read this before shipping it
 
@@ -263,6 +326,21 @@ benchmark, safe where first-token output is what matters, and **not** to be ship
 deployment whose acceptance gate is "128-token md5 unchanged" — use `opt3`+`opt4`+`opt5`
 there. `OV_DISABLE_SWISH_HOIST=1` turns opt-6 off at runtime without rebuilding.
 
+### opt-7: bit-exact prefill, changed decode
+
+| Check | Result |
+|---|---|
+| Prefill / first-token output (`ic=1`) | **bit-identical** to the opt-3+4+5+6 base |
+| 128-token greedy decode md5 (`ic=128`) | **can differ** from the opt-3+4+5+6 base |
+
+The prefill result follows from matching the standalone RMSNorm reduction structure and
+rounding to f16 before quantization. The decode difference has a different cause from opt-6:
+at batch 1, the unfused DynamicQuantize can skip and pass f16 directly to the FC, while a
+folded node must execute normalization and quantization because its input is unnormalized.
+This changes where the existing quantization approximation is applied. The opt-7 paired
+performance result is therefore appropriate for prefill/first-token workloads, not for a
+deployment whose acceptance gate requires an unchanged 128-token decode MD5.
+
 ## Scope / safety
 
 - **opt-1** only fires for dynamic, fully-depthwise convolutions; blocked layout is
@@ -280,8 +358,8 @@ there. `OV_DISABLE_SWISH_HOIST=1` turns opt-6 off at runtime without rebuilding.
   fused ops and no runtime activation-parameter input. The selected kernel is an existing
   vectorized implementation; the patch merely makes the safe dynamic subset eligible and
   supplies the optional shape-info argument expected by shape-agnostic kernels.
-- **opt-6** is the only patch here that is not bit-exact (see
-  [Correctness](#correctness)); everything else about it is narrowly guarded:
+- **opt-6 and opt-7** are the patches here that are not bit-exact over long decode (see
+  [Correctness](#correctness)); both are narrowly guarded:
   - the hoisting pass only fires when the Reshape has **exactly one consumer**, so no other
     consumer can ever observe pre-activation values, and `Swish(Reshape(x))` →
     `Reshape(Swish(x))` is a value-for-value identity for an elementwise op;
@@ -293,6 +371,9 @@ there. `OV_DISABLE_SWISH_HOIST=1` turns opt-6 off at runtime without rebuilding.
     function the conv1d epilogue implements, and the impl's JIT independently re-checks
     that it received exactly one SWISH fused desc. An activation the kernel cannot express
     therefore fails to fuse and stays a separate node — it can never be silently dropped.
+- **opt-7** is guarded by the RMSNorm and DynamicQuantize preconditions described above.
+  The fusing pass requires a single-consumer hand-off and a supported large-group kernel;
+  unsupported configurations remain unfused rather than being silently changed.
 
 ## Runtime switches
 
@@ -302,3 +383,9 @@ there. `OV_DISABLE_SWISH_HOIST=1` turns opt-6 off at runtime without rebuilding.
 | `OV_CONV1D_DEBUG=1` | opt-4: print the selected `G` once |
 | `OV_DISABLE_SWISH_HOIST=1` | opt-6: disable entirely, restoring the un-hoisted graph (useful for interleaved A/B without swapping binaries) |
 | `OV_SWISH_HOIST_ALL=1` | opt-6: additionally fuse the `in_proj_z` SiLU into the oneDNN FC post-op (extra gain, f32-accumulator evaluation) |
+
+## Additional Local Performance Report
+
+The historical platform measurements in this README are preserved. New local measurements,
+including opt-7 and both quantization variants on PA and SDPA, are recorded separately in
+[PA_SDPA_OPTIMIZATION_PERFORMANCE_REPORT.md](PA_SDPA_OPTIMIZATION_PERFORMANCE_REPORT.md).
