@@ -1,0 +1,174 @@
+Multiple distributions found for package optimum. Picked distribution: optimum
+[ INFO ] ==SUCCESS FOUND==: use_case: visual_text_gen, model_type: qwen3-5, model_Name: Qwen3.5-2B-INT4-g128
+[ INFO ] OV Config={'PERFORMANCE_HINT': 'LATENCY', 'ATTENTION_BACKEND': 'PA', 'CACHE_DIR': ''}
+[ INFO ] Model path=/home/chaofan/model_benchmark/benchmark/openvino/../models/Qwen3.5-2B-INT4-g128, openvino runtime version: 2026.3.0-22454-09c4cc4117e-qwen-ttft-optimizations, genai version: 2026.3.0.0-3278-0c38b54d7e7-qwen-ttft-llm-bench
+[ INFO ] Selected OpenVINO GenAI for benchmarking
+[ INFO ] Pipeline initialization time: 5.57s
+[ INFO ] Read prompts from /home/chaofan/model_benchmark/benchmark/openvino/../tests/prompts/qwen3.5_1k.jsonl
+[ INFO ] Numbeams: 1, benchmarking iter nums(exclude warm-up): 5, prompt nums: 1, prompt idx: [0]
+[ INFO ] [warm-up][P0] Input text: {'prompt': '<s>[INST] <<SYS>> A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user\'s questions. <</SYS>> You will act as a Christian, and fully summarize following text:\nSometimes it\'s nice to take a minute in the pew by yourself beforehand. You have this beautiful church probably almost all to yourself. Can you feel its energy resonating through you? Can you feel the majesty of the Lord\'s kingdom and how you\'re a part of it? Take a moment to kneel and pray with your head down and hands clasped together. Reflect on your faith and how you feel currently. Think about how you\'ve been responding to God\'s call and how you\'ve been living in the light of his love. When the priest is ready for you, of course. You\'ll probably see him there by his lonesome or someone else walk out just before you. Sit down either across from him or behind the screen -- it\'s totally up to you whether or not you pr ... [truncated to 1024]
+[ INFO ] [warm-up][P0] Input image nums: 0
+[ INFO ] [warm-up][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [warm-up][P0] Text generation start: 2026-08-25T20:08:15.231814
+[ INFO ] [warm-up][P0] Text generation end: 2026-08-25T20:08:33.365939
+[ INFO ] [warm-up][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 4.82ms, Detokenization Time: 0.93ms,  Multimodal Embeddings Preparation Time: 108.48ms, Generation Time: 18.13s, Latency: 35.4181 ms/token
+[ INFO ] [warm-up][P0] First token latency: 878.72 ms, other tokens latency: 33.75 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [warm-up][P0] First infer latency: 678.46 ms, other infers latency: 33.75 ms/infer, inference count: 512
+[ INFO ] [warm-up][P0] Result MD5:['916653d06d67a8be2c7f9bf5bed8fbb9']
+[ INFO ] [warm-up][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a specific, somewhat informal tone. It outlines the physical setting (the church pew), the ritual (the sign of the cross), the specific prayers (the standard "Bless me, Father" and the Act of Contrition), and the procedure for confession (how to speak to the priest).
+
+Here is a summary of the key points from the text:
+
+### **Setting the Scene**
+*   **The Atmosphere:** It is recommended to take a moment alone in the pew before the service begins. This allows one to feel the energy of the church and the majesty of the Lord's Kingdom, acknowledging one's place within it.
+*   **The Ritual:** The text describes the standard practice of kneeling and praying with head down and hands clasped. It emphasizes that the priest is ready to welcome the individual, regardless of whether they choose to remain anonymous or sit across from him.
+*   **The Sign of the Cross:** Upon the priest's prompt, the individual should say, "Bless me, Father, for I have sinned. It has been 10 years since my last confession." This is described as the standard traditional phrasing.
+*   **The Byzantine Rite:** If the user is Roman Catholic, the text notes a slight variation where the priest may sit to the side and place his *epitrachelion* (a small cloth) on the individual's head before administering the Prayer of Absolution.
+
+### **The Conversation**
+*   **No Pressure:** The text explicitly states there is "zero pressure" on the individual.
+*   **The Priest's Perspective:** It reassures the user that the priest has likely heard many such confessions before; therefore, the content of the confession will not "blow his mind."
+*   **How to Speak:** The text advises the user to be honest but not to go into excessive detail. A simple statement like "I did so and so" is sufficient.
+*   **The Priest's Role:** The priest cares about the honesty of the heart and the intention to leave with a clean heart. He will likely ask about intentions and sins, but mainly to reassure the user that God loves them.
+
+### **The Sacrament of Penance**
+*   **The Purpose:** "Penance" is described as an expression of regret and repentance, showing God the user is truly sorry and wishes to be
+[ INFO ] [warm-up][P0] start: 2026-08-25T20:08:15.231642, end: 2026-08-25T20:08:33.367512
+[ INFO ] [1][P0] Input image nums: 0
+[ INFO ] [1][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [1][P0] Text generation start: 2026-08-25T20:08:33.367660
+[ INFO ] [1][P0] Text generation end: 2026-08-25T20:08:50.851703
+[ INFO ] [1][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 1.26ms, Detokenization Time: 0.41ms,  Multimodal Embeddings Preparation Time: 7.22ms, Generation Time: 17.48s, Latency: 34.1485 ms/token
+[ INFO ] [1][P0] First token latency: 330.60 ms, other tokens latency: 33.56 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [1][P0] First infer latency: 320.87 ms, other infers latency: 33.56 ms/infer, inference count: 512
+[ INFO ] [1][P0] Result MD5:['b02605bf46e99a1f04ea39a6016f5f42']
+[ INFO ] [1][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a specific, somewhat informal tone. It emphasizes the importance of preparation, the nature of the sacrament, and the attitude one should bring to the encounter.
+
+Here is a summary of the key points from the text:
+
+### **Preparation and Atmosphere**
+*   **Quiet Space:** It is recommended to spend a moment alone in the pew before the service begins. This allows one to feel the energy of the church and reflect on one's faith.
+*   **Anonymity:** The text notes that while the priest may sit across from you or behind a screen, the priest will not treat you differently based on whether you choose to remain anonymous.
+*   **Sign of the Cross:** The standard traditional phrasing is to say, "Bless me, Father, for I have sinned. It has been 10 years since my last confession."
+*   **Flexibility:** While the traditional phrasing is standard, the text acknowledges that sitting down and saying hello is also acceptable. The priest knows what he is doing.
+
+### **The Nature of the Encounter**
+*   **Location:** One can sit anywhere—across from the priest or behind the screen.
+*   **Privacy:** The text reassures the reader that the priest will not treat them differently based on their desire to remain anonymous.
+*   **The Priest's Perspective:** The text explains that the priest has likely heard many confessions before. Therefore, whatever you say will not "blow his mind."
+*   **Communication:** The interaction is described as a "casual conversation." There is "zero pressure" on the penitent. The priest cares that you are honest and that your heart is in the right place.
+
+### **Confession Process**
+*   **Starting the Conversation:** Once the sign of the cross is made, the priest will ask about the duration since the last confession, your feelings, and your faith.
+*   **Addressing Sins:** The penitent should feel free to talk about sins, starting with the most serious and moving to the least. A simple "I did so and so" is sufficient; there is no need to go into excessive detail.
+*   **Attitude:** The text emphasizes that the priest is there to help and that God loves you. It stresses honesty and a clean heart.
+*   **Act of Contrition:** This is the formal expression
+[ INFO ] [1][P0] start: 2026-08-25T20:08:33.367557, end: 2026-08-25T20:08:50.853215
+[ INFO ] [2][P0] Input image nums: 0
+[ INFO ] [2][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [2][P0] Text generation start: 2026-08-25T20:08:50.853365
+[ INFO ] [2][P0] Text generation end: 2026-08-25T20:09:08.309063
+[ INFO ] [2][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 1.16ms, Detokenization Time: 0.40ms,  Multimodal Embeddings Preparation Time: 6.71ms, Generation Time: 17.46s, Latency: 34.0931 ms/token
+[ INFO ] [2][P0] First token latency: 329.56 ms, other tokens latency: 33.51 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [2][P0] First infer latency: 320.46 ms, other infers latency: 33.51 ms/infer, inference count: 512
+[ INFO ] [2][P0] Result MD5:['2ec8befc4e838521976df695c62ae908']
+[ INFO ] [2][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a supportive and reassuring tone. It emphasizes that confession is a normal, non-intimidating part of the Christian life, where the priest is simply a fellow traveler on the path to holiness.
+
+Here is a summary of the key points from the text:
+
+*   **Preparing for Confession:** It is recommended to spend a quiet moment in the pew before the service. This allows you to feel the energy of the church, reflect on your faith, and prepare your heart. You are welcome to pray with your head down and hands clasped, or simply sit and say hello.
+*   **The Setting:** Whether you sit across from the priest or behind a screen, the priest will know. He will not treat you differently based on your anonymity.
+*   **The Ritual:** The standard traditional phrasing is to say, "Bless me, Father, for I have sinned. It has been 10 years since my last confession."
+*   **The Byzantine Rite:** If you are a Roman Catholic, the priest may sit to your side and place his *epitrachelion* (a small cloth) on your head before administering the Prayer of Absolution. The core purpose remains the same: you sit down, make the sign of the cross, and follow the priest's lead.
+*   **The Conversation:** The priest will ask about the length of time since your last confession, your feelings, your faith, and what sins you wish to discuss. The text stresses that this is a casual conversation with no pressure.
+*   **Handling the Conversation:** Do not fret if you forget details. The priest cares about your honesty and your heart's intent. He will likely ask about your intentions but mainly reassure you that God loves you.
+*   **The Process:** If the priest asks about specific sins, you can list them from the most serious to the least. You do not need to go into excessive detail; a simple "I did so and so" is sufficient.
+*   **The Outcome:** The priest will likely suggest ways to grow closer to God. He promises that you will feel better after the session, as you are being helped.
+*   **Act of Contrition:** The text provides the standard text for the Act of Contrition (for Catholics) and a brief version for others, emphasizing sincere repentance and a firm resolve to avoid sin.
+*   **
+[ INFO ] [2][P0] start: 2026-08-25T20:08:50.853266, end: 2026-08-25T20:09:08.310672
+[ INFO ] [3][P0] Input image nums: 0
+[ INFO ] [3][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [3][P0] Text generation start: 2026-08-25T20:09:08.310864
+[ INFO ] [3][P0] Text generation end: 2026-08-25T20:09:25.767277
+[ INFO ] [3][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 1.14ms, Detokenization Time: 0.41ms,  Multimodal Embeddings Preparation Time: 6.41ms, Generation Time: 17.46s, Latency: 34.0945 ms/token
+[ INFO ] [3][P0] First token latency: 331.49 ms, other tokens latency: 33.51 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [3][P0] First infer latency: 322.51 ms, other infers latency: 33.50 ms/infer, inference count: 512
+[ INFO ] [3][P0] Result MD5:['0b681aacd830853ecca40733a71b5c1a']
+[ INFO ] [3][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a supportive and reassuring tone. It emphasizes that confession is a normal, non-intimidating part of the Christian life, where the priest is simply a fellow traveler on the path to holiness.
+
+Here is a summary of the key points from the text:
+
+*   **Preparation and Atmosphere:** It is encouraged to spend a quiet moment in the pew before the service. The environment is described as sacred, with the energy of the church resonating with the presence of the Lord's Kingdom.
+*   **The Setting:** Confession can be done in a private pew or with a priest. The text notes that the priest will likely be alone or with a few others, and the setting is designed to be welcoming, whether you choose to remain anonymous or sit across from him.
+*   **The Ritual:** The standard practice involves the sign of the cross and a specific prayer of contrition ("Bless me, Father, for I have sinned...").
+*   **The Byzantine Rite:** This section briefly mentions that in the Byzantine Rite, the priest may sit to the side and place an *epitrachelion* (a small cloth) on the person's head before administering the absolution.
+*   **The Conversation:** Once the ritual is complete, the priest will ask about the duration since the last confession, current feelings, faith status, and specific sins. The text stresses that this is a casual conversation with no pressure to confess every single minor sin.
+*   **The Priest's Perspective:** The text reassures the reader that the priest has likely heard many such confessions before. It clarifies that the priest's primary goal is to help the person feel loved by God and to offer a "clean slate," rather than to judge or correct the person.
+*   **The Process:** The guide explains how to speak to the priest (starting with serious sins first), how to answer questions honestly without fear, and how to express regret through the Act of Contrition.
+*   **The Outcome:** The ultimate message is that the priest will not change the person, but rather offer mercy and grace. The text concludes that with a clean heart, the person is welcome, and the priest will help them return to God.
+
+In essence, the text is a comforting instruction manual that removes the fear of confession, framing it as a gentle, loving encounter where the priest is there to help
+[ INFO ] [3][P0] start: 2026-08-25T20:09:08.310727, end: 2026-08-25T20:09:25.768757
+[ INFO ] [4][P0] Input image nums: 0
+[ INFO ] [4][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [4][P0] Text generation start: 2026-08-25T20:09:25.768914
+[ INFO ] [4][P0] Text generation end: 2026-08-25T20:09:43.220300
+[ INFO ] [4][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 1.12ms, Detokenization Time: 0.39ms,  Multimodal Embeddings Preparation Time: 6.59ms, Generation Time: 17.45s, Latency: 34.0846 ms/token
+[ INFO ] [4][P0] First token latency: 331.10 ms, other tokens latency: 33.50 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [4][P0] First infer latency: 321.96 ms, other infers latency: 33.50 ms/infer, inference count: 512
+[ INFO ] [4][P0] Result MD5:['dab8422bde2e76c3538d6ca4be105fea']
+[ INFO ] [4][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a tone that is both reverent and reassuring. It emphasizes that confession is a private, non-judgmental encounter where the priest's primary goal is to hear your heart, not to judge your actions.
+
+Here is a summary of the key points from the text:
+
+*   **The Atmosphere:** Taking a moment alone in the pew before the service helps you feel the energy of the church and the majesty of the Lord's Kingdom. You are invited to kneel and pray, reflecting on your faith and how you have responded to God's call.
+*   **The Setting:** When the priest arrives, you may sit across from him or behind the screen. The text reassures the reader that the priest will not treat you differently based on whether you choose to remain anonymous.
+*   **The Ritual:** The standard phrasing for the sign of the cross is "Bless me, Father, for I have sinned. It has been 10 years since my last confession." The text notes that while the Byzantine Rite has specific physical elements (like the epitrachelion), the spiritual essence remains the same.
+*   **The Process:** Once seated and making the sign of the cross, the conversation begins. The priest will ask about the duration since the last confession, your feelings, and your current faith. You are encouraged to be honest about your sins without feeling pressured to detail every single one.
+*   **The Priest's Perspective:** The text reassures the reader that the priest has likely heard many such confessions before. It emphasizes that the priest cares about your honesty and your sincere heart, not about the length of your confession.
+*   **The Goal:** The ultimate goal is to leave with a "clean heart." The text stresses that there is no wrong way to confess; the focus is on a clean slate and God's love.
+*   **The Act of Contrition:** The text provides the standard prayers for repentance. It distinguishes between the Roman Catholic version (focusing on offending God) and the Byzantine version (focusing on offending the Holy Spirit), though the core message of sincere repentance remains consistent.
+*   **The Outcome:** The text concludes with reassurance, stating that the absolution will bring a "brand new, clean slate," and that the priest is there to help, not to judge.
+
+Overall, the text serves as a
+[ INFO ] [4][P0] start: 2026-08-25T20:09:25.768802, end: 2026-08-25T20:09:43.221779
+[ INFO ] [5][P0] Input image nums: 0
+[ INFO ] [5][P0] Input video nums: 0
+[ WARNING ] Enabled input prompt permutations. It means that generated results may vary on different steps and the prompt grows by one leading token. This defeats the prefix cache so first-token latency reflects a cold prefill. If it is not expected, please specify --disable_prompt_permutation in your benchmarking command to disable this behavior
+[ INFO ] [5][P0] Text generation start: 2026-08-25T20:09:43.221927
+[ INFO ] [5][P0] Text generation end: 2026-08-25T20:10:00.722775
+[ INFO ] [5][P0] Input token size: 1002, Output size: 512, Infer count: 512, Tokenization Time: 1.12ms, Detokenization Time: 0.53ms,  Multimodal Embeddings Preparation Time: 6.78ms, Generation Time: 17.50s, Latency: 34.1813 ms/token
+[ INFO ] [5][P0] First token latency: 333.34 ms, other tokens latency: 33.59 ms/token, len of input tokens: 1002 * 1
+[ INFO ] [5][P0] First infer latency: 324.05 ms, other infers latency: 33.59 ms/infer, inference count: 512
+[ INFO ] [5][P0] Result MD5:['21fdbd23004a586d544f6d99a9e28271']
+[ INFO ] [5][P0] Generated: The text you provided is a guide on how to approach a Catholic priest for confession, written in a specific, somewhat informal tone. It emphasizes the importance of preparation, the nature of the sacrament, and the attitude one should bring to the encounter.
+
+Here is a summary of the key points from the text:
+
+### **Preparation and Atmosphere**
+*   **Quiet Space:** It is recommended to spend a moment alone in the pew before the service begins. This allows one to feel the energy of the church and reflect on the majesty of the Lord's Kingdom.
+*   **Posture:** The text suggests kneeling with head down and hands clasped to reflect on faith and how one has responded to God's call.
+*   **Privacy:** While the text mentions sitting "either across from him or behind the screen," it ultimately emphasizes that the priest will not treat you differently regardless of where you sit.
+
+### **The Act of Confession**
+*   **The Sign of the Cross:** This is the standard traditional phrasing. The text notes that if you are Roman Catholic, the priest may sit to your side and place his *epitrachelion* (a small cloth) on your head before administering the Prayer of Absolution.
+*   **The Process:** Once the sign is made, the priest will ask about the duration since the last confession, your feelings, your faith, and specific sins you wish to discuss.
+*   **No Pressure:** The text explicitly states there is "zero pressure" on the person. It reassures the reader that there is no wrong way to go about it.
+*   **The Priest's Perspective:** The text assures the reader that the priest has likely heard many such confessions before. Therefore, the content of the confession will not "blow his mind."
+*   **How to Speak:** The text advises the person to be honest but not to go into excessive detail. A simple statement like "I did so and so" is sufficient.
+*   **Attitude:** The focus should be on honesty and a clean heart, not on the length of the conversation.
+
+### **Repentance and Absolution**
+*   **Act of Contrition:** This is the prayer of regret and repentance. The text provides two versions:
+    1.  **General:** "My God, I am sorry for my sins with all my heart..."
+    2.  **Roman Catholic:** "Oh my God, I
+[ INFO ] [5][P0] start: 2026-08-25T20:09:43.221824, end: 2026-08-25T20:10:00.724285
+[ INFO ] <<< Warm-up iteration is excluded. >>>
+[ INFO ] [Total] Iterations: 5
+[ INFO ] [Average] P[0] Input token size: 1002, 1st token latency: 331.22 ms, 2nd token latency: 33.53 ms/token, 2nd tokens throughput: 29.82 tokens/s

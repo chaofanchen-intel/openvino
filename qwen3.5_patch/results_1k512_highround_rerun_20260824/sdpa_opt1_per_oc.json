@@ -1,0 +1,201 @@
+{
+    "metadata": {
+        "model": "Qwen3.5-2B-INT4",
+        "framework": "ov",
+        "device": "GPU",
+        "precision": "",
+        "num_beams": 1,
+        "batch_size": 1
+    },
+    "perfdata": {
+        "compile_time": 5.027466823812574,
+        "results": [
+            {
+                "iteration": 0,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 20.49206,
+                "latency": 40.02356,
+                "first_latency": 934.8699,
+                "second_avg_latency": 38.25973,
+                "first_infer_latency": 684.185,
+                "second_infer_avg_latency": 37.4406,
+                "tokenization_time": 4.939,
+                "detokenization_time": 1.055,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "336085cfc438c019fa8a3219e9272788"
+                ],
+                "start": "2026-08-25T20:19:11.762671",
+                "end": "2026-08-25T20:19:32.256626",
+                "second_token_throughput": 26.13714,
+                "total_throughput": 24.98529
+            },
+            {
+                "iteration": 1,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 19.33431,
+                "latency": 37.76232,
+                "first_latency": 469.7977,
+                "second_avg_latency": 36.91264,
+                "first_infer_latency": 463.552,
+                "second_infer_avg_latency": 36.15325,
+                "tokenization_time": 1.185,
+                "detokenization_time": 0.604,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "e266acde069b03e3218b2134aea74b10"
+                ],
+                "start": "2026-08-25T20:19:32.256671",
+                "end": "2026-08-25T20:19:51.592610",
+                "second_token_throughput": 27.09099,
+                "total_throughput": 26.48142
+            },
+            {
+                "iteration": 2,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 19.20409,
+                "latency": 37.50798,
+                "first_latency": 466.63354,
+                "second_avg_latency": 36.66414,
+                "first_infer_latency": 460.099,
+                "second_infer_avg_latency": 35.92184,
+                "tokenization_time": 1.155,
+                "detokenization_time": 0.507,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "6e319ad7a3dad4d94f83dc241e15e943"
+                ],
+                "start": "2026-08-25T20:19:51.592654",
+                "end": "2026-08-25T20:20:10.798358",
+                "second_token_throughput": 27.2746,
+                "total_throughput": 26.66099
+            },
+            {
+                "iteration": 3,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 19.2861,
+                "latency": 37.66816,
+                "first_latency": 468.63054,
+                "second_avg_latency": 36.82076,
+                "first_infer_latency": 462.257,
+                "second_infer_avg_latency": 36.06103,
+                "tokenization_time": 1.128,
+                "detokenization_time": 0.557,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "c4e75e7ef06f0213295afe4b2df8d7ae"
+                ],
+                "start": "2026-08-25T20:20:10.798397",
+                "end": "2026-08-25T20:20:30.086128",
+                "second_token_throughput": 27.15859,
+                "total_throughput": 26.54762
+            },
+            {
+                "iteration": 4,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 19.28473,
+                "latency": 37.66548,
+                "first_latency": 467.57559,
+                "second_avg_latency": 36.82001,
+                "first_infer_latency": 461.226,
+                "second_infer_avg_latency": 36.07516,
+                "tokenization_time": 1.181,
+                "detokenization_time": 0.583,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "aaa1224c47ca7639deebcc22ea949d39"
+                ],
+                "start": "2026-08-25T20:20:30.086168",
+                "end": "2026-08-25T20:20:49.372541",
+                "second_token_throughput": 27.15915,
+                "total_throughput": 26.5495
+            },
+            {
+                "iteration": 5,
+                "input_size": 1002,
+                "infer_count": 512,
+                "output_size": 512,
+                "generation_time": 19.28543,
+                "latency": 37.66686,
+                "first_latency": 468.71826,
+                "second_avg_latency": 36.81965,
+                "first_infer_latency": 462.263,
+                "second_infer_avg_latency": 36.06583,
+                "tokenization_time": 1.125,
+                "detokenization_time": 0.406,
+                "prompt_idx": 0,
+                "result_md5": [
+                    "35cde01e6b12242aa582e68740c0d6e0"
+                ],
+                "start": "2026-08-25T20:20:49.372587",
+                "end": "2026-08-25T20:21:08.659658",
+                "second_token_throughput": 27.15941,
+                "total_throughput": 26.54854
+            }
+        ],
+        "resource_usage": {
+            "enabled": true,
+            "cpu_avg_util_percent": 7.2025210084033615,
+            "cpu_per_core_avg_util_percent": {
+                "cpu0": 15.905882352941177,
+                "cpu1": 44.463865546218486,
+                "cpu2": 18.545378151260504,
+                "cpu3": 14.677310924369747,
+                "cpu4": 1.250420168067227,
+                "cpu5": 1.7714285714285716,
+                "cpu6": 1.3798319327731092,
+                "cpu7": 1.6840336134453782,
+                "cpu8": 1.6243697478991597,
+                "cpu9": 1.4487394957983193,
+                "cpu10": 1.3100840336134454,
+                "cpu11": 4.409243697478991,
+                "cpu12": 2.836974789915966,
+                "cpu13": 1.4285714285714286,
+                "cpu14": 1.0176470588235293,
+                "cpu15": 1.1596638655462186
+            },
+            "cpu_samples": 119,
+            "gpu_available": true,
+            "gpu_avg_util_percent": "",
+            "gpu_memory_avg_util_percent": "",
+            "gpu_samples": 0,
+            "gpu_memory_samples": 0,
+            "npu_available": true,
+            "npu_avg_util_percent": 0.0,
+            "npu_samples": 119,
+            "avg_rss_mem_mib": 1268.145450367647,
+            "peak_rss_mem_mib": 1276.15625,
+            "avg_sys_mem_mib": 8510.246881565126,
+            "peak_sys_mem_mib": 8645.21484375,
+            "memory_samples": 119
+        },
+        "initial_sys_mem(MiB)": "",
+        "initial_rss_mem(MiB)": "",
+        "compile_max_rss_mem(MiB)": "",
+        "compile_max_sys_mem(MiB)": "",
+        "compile_max_increase_rss_mem(MiB)": "",
+        "compile_max_increase_sys_mem(MiB)": "",
+        "results_averaged": {
+            "generation_time": 19.27893,
+            "latency": 37.65416,
+            "first_latency": 468.27113,
+            "second_avg_latency": 36.80744,
+            "first_infer_latency": 461.8794,
+            "second_infer_avg_latency": 36.05542,
+            "tokenization_time": 1.1548,
+            "detokenization_time": 0.5314,
+            "second_token_throughput": 27.16842,
+            "total_throughput": 26.55761
+        }
+    }
+}
