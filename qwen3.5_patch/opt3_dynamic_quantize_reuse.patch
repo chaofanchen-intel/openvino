@@ -1,0 +1,82 @@
+diff --git a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+index 4d4442d4e89ba00f2722d083dbcbe817175a3115..5284f07ea24a604e2fe26358ee265268e51dee40 100644
+--- a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
++++ b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+@@ -24,11 +24,21 @@ static bool should_skip_execution(const dynamic_quantize_node& node, const layou
+         || !act_layout.is_static())
+         return false;
+ 
+-    // Do not skip dynamic quantization if next node is not fully connected.(such as SDPA)
+-    OPENVINO_ASSERT(node.get_users().size() == node.get_outputs_count(),
+-                    "Dynamic quantization is supposed to have only one user-node with duplicated connection: ", node.id());
+-    if (!(*node.get_users().begin())->is_type<fully_connected>())
+-        return false;
++    // Normally a DynamicQuantize feeds exactly one FullyConnected, which consumes every
++    // DQ output (quantized data + scale[+zp]), so users.size() == outputs_count.
++    // When several FullyConnected that share the same activation reuse a single DQ
++    // (e.g. q/k/v/z or gate/up projections), users.size() == outputs_count * num_consumers.
++    // Skipping is still valid in that case - the DQ becomes an f16 pass-through that every
++    // consumer reads identically. Require the user count to be a whole number of full
++    // consumers and that all of them are fully_connected (skipping is a no-op only for the
++    // FC f16 path).
++    const size_t outs = node.get_outputs_count();
++    OPENVINO_ASSERT(outs > 0 && node.get_users().size() % outs == 0,
++                    "Dynamic quantization users are not a whole multiple of its outputs: ", node.id());
++    for (const auto& u : node.get_users()) {
++        if (!u->is_type<fully_connected>())
++            return false;
++    }
+ 
+     // If batch size is 1, dynamic_quantize is disabled for performance reason
+     size_t input_batch = act_layout.batch();
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp b/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
+index 58ed3e3834b5d5a6857a69ef3290356035db4b94..c28be9c40bfa2956475cea463e01e8db923416e6 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
+@@ -18,6 +18,31 @@
+ 
+ namespace ov::intel_gpu {
+ 
++namespace {
++bool dq_attrs_equal(const ov::op::internal::DynamicQuantize::Attributes& a,
++                    const ov::op::internal::DynamicQuantize::Attributes& b) {
++    return a.quantization_type == b.quantization_type &&
++           a.quantization_dt == b.quantization_dt &&
++           a.scale_dt == b.scale_dt &&
++           a.zp_dt == b.zp_dt &&
++           a.precomputed_reduction == b.precomputed_reduction &&
++           a.precomputed_reduction_dt == b.precomputed_reduction_dt &&
++           a.output_storage_type == b.output_storage_type &&
++           a.group_sizes == b.group_sizes;
++}
++
++std::shared_ptr<ov::op::internal::DynamicQuantize>
++find_reusable_dq(const ov::Output<ov::Node>& act,
++                 const ov::op::internal::DynamicQuantize::Attributes& cfg) {
++    for (const auto& ti : act.get_target_inputs()) {
++        auto cand = ov::as_type_ptr<ov::op::internal::DynamicQuantize>(ti.get_node()->shared_from_this());
++        if (cand && dq_attrs_equal(cand->get_attrs(), cfg))
++            return cand;
++    }
++    return nullptr;
++}
++}  // namespace
++
+ // precomputed_reduction is providing partial reduction of activation from dynamic quantization into onednn for faster computation
+ // It is used for asymmetric weight.
+ DynamicQuantizeFullyConnected::DynamicQuantizeFullyConnected(uint64_t group_size,
+@@ -116,7 +141,13 @@ DynamicQuantizeFullyConnected::DynamicQuantizeFullyConnected(uint64_t group_size
+             config.zp_dt = element::u8; // it supports u8 only now
+         }
+ 
+-        std::shared_ptr<ov::op::internal::DynamicQuantize> dyn_quan = std::make_shared<ov::op::internal::DynamicQuantize>(m_fc->input_value(0), config);
++        // Reuse a DynamicQuantize already inserted on this same activation by a sibling
++        // FullyConnectedCompressed (e.g. q/k/v/z or gate/up sharing a layernorm output)
++        // when the config is identical, instead of inserting a duplicate.
++        auto dyn_quan = find_reusable_dq(m_fc->input_value(0), config);
++        if (!dyn_quan) {
++            dyn_quan = std::make_shared<ov::op::internal::DynamicQuantize>(m_fc->input_value(0), config);
++        }
+ 
+         int dyn_quan_output_idx = 2;
+         auto optional_a_zp = config.quantization_type == QuantizationType::Symmetric ?

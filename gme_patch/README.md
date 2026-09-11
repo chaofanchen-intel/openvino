@@ -1,0 +1,253 @@
+# Patches — GME Qwen2-VL INT4 GPU 优化
+
+## Base
+
+所有 patch 均基于 **OpenVINO 官方 release tag `2026.3.1`**：
+
+```
+commit 759c5a6ab8c066af5f4bc5ebd04643706012a37d (tag: 2026.3.1)
+```
+
+补丁只包含 Intel GPU plugin 的 GME 优化，不包含其他模型优化或 benchmark 工具的改动。
+每个 patch 都是相对于本仓库 `2026.3.1` 基线的源码差异。
+
+已在纯净 `2026.3.1` checkout 上验证过
+`git apply` 通过（单独 apply、顺序 apply、合并 apply 三种方式都验证）。
+2026.3.1 在 `dynamic_quantize.hpp` 中新增了 `innermost_size` 状态；opt-4/opt-5
+的 `fused_rms`/`fused_mvn` 字段已按新的序列化、比较和 hash 布局重新生成，未修改
+优化逻辑。
+
+## 文件
+
+| 文件 | 内容 | 改动量 |
+| --- | --- | --- |
+| `opt1_sdpa_gqa_broadcast_stateless.patch` | GQA `repeat_kv` 的 `Unsqueeze→Broadcast→Reshape` 融合支持无状态模型 | 1 file, +13 −5 |
+| `opt2_sdpa_output_transpose_fusion.patch` | 新增 `TransposeSDPATransposeMatcher`；修复 `sdpa_gen_micro` 的 dispatch 与 canonicalization；修复 `calc_output_layout()` 漏用 `output_transpose_order` | 4 files, +257 −11 |
+| `opt3_int4_wide_fc_ncontiguous_weights.patch` | 宽 INT4 投影（`N ≥ 4K` 且 ≥128 行）的权重重排成 N 连续，matmul 描述符改用 `abc` | 3 files, +115 −3 |
+| `all_gme_int4_gpu_opts.patch` | 以上三者合并 | 8 files, +385 −19 |
+| `opt4_dq_reuse_rms_fusion.patch` | sibling FC 共享相同 DynamicQuantize；新增 GME 1536-wide RMSNorm→per-token symmetric INT8 DQ 融合；暴露已有 DQ threshold property | 14 files, +320 −10 |
+| `all_gme_int4_gpu_opts_round6.patch` | opt-1/2/3 + opt-4 合并 | 22 files, +705 −29 |
+| `opt5_visual_mvn_dq_fusion.patch` | 视觉 hidden=1280 的 `MVN + gamma + beta → per-token DQ` 融合 | 11 files, +219 −10 |
+| `all_gme_int4_gpu_opts_round7.patch` | opt-1/2/3/4 + opt-5 合并 | 22 files, +914 −29 |
+| `opt6_qkv_headfirst_permute.patch` | GME visual `[L,3,16,80]→[3,16,L,80]` 专用 half8 transpose kernel | 4 files, +126 |
+| `all_gme_int4_gpu_opts_round8.patch` | opt-1/2/3/4/5 + opt-6 合并 | 26 files, +1040 −29 |
+
+前三个 patch 相互独立，可单独 apply；但 **opt-2 单独用时依赖它自带的运行时修复**
+（否则一旦融合触发就会 GPU 挂死），这些修复已包含在 opt-2 内。
+
+opt-4 也可从纯净 `2026.3.1` 单独 apply，或者顺序 apply 在
+`all_gme_int4_gpu_opts.patch` 之后。两种方式以及新的 round-6 combined patch 都已在
+detached clean tag worktree 上通过 `git apply --check`。opt-4 里的 DQ reuse 默认生效；
+RMS→DQ 融合只有显式设置 `GPU_DYNAMIC_QUANTIZATION_THRESHOLD=0` 才生效，默认短 query
+路径保持原来的 f16 bypass。
+
+opt-5 是 **round-6 之上的增量 patch**，不能单独 apply 到纯净 tag；使用
+`all_gme_int4_gpu_opts_round6.patch` 后再 apply opt-5，或者直接使用 round-7 combined。
+两种方式都已在 detached clean tag worktree 上通过 `git apply --check`。
+
+opt-6 是 **round-7 之上的增量 patch**。使用 round-7 combined 后追加 opt-6，或者直接
+使用 round-8 combined。两种方式都已在 clean tag worktree 上通过 `git apply --check`；
+主工作树的相同最终源码已完整构建 GPU plugin。
+
+早期的 2026-08-13 opt-2 版本曾覆盖已融合的输入 transpose order，并在部分 rank-3
+vision 路径触发 `CL_OUT_OF_RESOURCES`。本目录只保留已修复的 opt-2；修复后的 matcher
+会主动跳过 rank-3 vision SDPA，避免改变该路径。
+
+## 应用
+
+```bash
+git checkout 2026.3.1            # 或任何 src/ 与该 tag 一致的 checkout
+git apply gme_patch/all_gme_int4_gpu_opts.patch
+
+cmake --build <build-dir> --target openvino_intel_gpu_plugin -j
+cmake --install <build-dir>
+```
+
+只需重编 GPU plugin，不需要全量重编。
+
+要加入第六轮语言优化，改用：
+
+```bash
+git apply gme_patch/all_gme_int4_gpu_opts_round6.patch
+```
+
+或者在旧 combined patch 后追加 `opt4_dq_reuse_rms_fusion.patch`。
+
+要加入第七轮视觉 MVN 融合，改用：
+
+```bash
+git apply gme_patch/all_gme_int4_gpu_opts_round7.patch
+```
+
+或在 round-6 combined 之后追加 `opt5_visual_mvn_dq_fusion.patch`。
+
+要加入第八轮 QKV transpose kernel，改用：
+
+```bash
+git apply gme_patch/all_gme_int4_gpu_opts_round8.patch
+```
+
+或在 round-7 combined 之后追加 `opt6_qkv_headfirst_permute.patch`。
+
+## 影响面
+
+| 项 | 结论 |
+| --- | --- |
+| 数值（opt-1 + opt-2） | **bit-identical**（INT4 / INT8 / INT4-gs64，含 padded batch，max abs diff = 0） |
+| 数值（加上 opt-3） | 七个用例里六个仍 bit-identical；padded batch cos 0.99950 / max_abs 1.19e-2。opt-3 换的是权重 layout 而非算术，`layout_accuracy_probe` 证明 oneDNN 侧 `cab`/`abc` 数值中性，重排本身逐 nibble 位正确；残留漂移来自 gemm 分块顺序，比 INT4 自身的量化噪声底（cos 0.918–0.989）低约一个数量级 |
+| 数值（opt-5） | strict control/fused 在 L=1024/2304/2916/5040 四个 grid 均 **bit-identical**；真实 public image/fused 及 compiled-model cache reload 也 `max_abs=0` |
+| 数值（opt-6） | INT8 / INT4 / INT4-gs64 四-grid、standard golden 和 compiled-model cache reload 全部 **bit-identical** |
+| 有状态生成式模型 | 无回归（`Qwen3-1.7B-INT4` greedy 32 步，token id + 首步 logits SHA + top-8 逐位相同） |
+| 其他模型（`Qwen3-VL-Embedding-2B`） | 无影响。text / image / fused 共 28 个 workload（INT8 + INT4）与 stock **逐位相同**；vision tower 的 rank-3 SDPA 会被 opt-2 matcher 跳过 |
+| 适用范围 | opt-1 惠及任何**无状态 GQA** 模型；opt-2 惠及以 `SDPA → Transpose → Reshape → o_proj` 收尾、且 **SDPA 输出为 rank-4** 的 attention 块（rank-3 的 headless attention——Qwen-VL 系列 vision tower——被 `supports_micro_sdpa()` 强制走 `sdpa_opt`，该 kernel 不认 `output_transpose_order`，故 matcher 主动跳过）；opt-3 惠及任何 **group 量化 INT4、`N ≥ 4K` 的宽投影**（典型是 MLP 的 gate/up），且只在 ≥128 行的 prefill 型负载上生效 |
+| opt-5 适用范围 | 仅匹配 planar f16、last-axis hidden=1280、`MVN→prod(gamma)→sum(beta)→per-token symmetric i8 DQ`，且设备支持 256-WI workgroup；其他形态不改写 |
+| opt-6 适用范围 | 仅匹配 planar dense f16、internal order `[1,3,2,0]`、input F/Y/X=`3/16/80`、output B/F/X=`3/16/80` 的 QKV transpose；其他 permute 仍走原 selector |
+| 显存 | **opt-3 会给命中的权重多留一份副本**。GME 上是 56 × 6.56 MiB ≈ **367 MiB** 常驻。行数不达标时不重排、不额外分配 |
+| 平台 | 仅 Intel GPU plugin；CPU / NPU 不受影响 |
+| 依赖 | 无。不需要 `ENABLE_DEBUG_CAPS`，不引入新的 config option 或环境变量 |
+
+opt-4 复用了 plugin 已有但原来只在内部可见的
+`GPU_DYNAMIC_QUANTIZATION_THRESHOLD`，将它暴露为 RW property 并纳入 compiled-model
+cache key；没有增加新的 option。默认值仍是 64。
+
+opt-5 同样只在 visual compile 显式设置 threshold=0 时触发。Python runtime 提供
+`visual_dynamic_quantization_threshold=0`，只作用于视觉 IR，不改变短 text/query。
+它只匹配 planar f16、hidden=1280、last-axis MVN affine 和 per-token symmetric i8 DQ。
+
+第九轮使用当前 package/runtime 做了完整 public API、batch、FP32 cosine 和 document
+embedding 复测；`visual_dynamic_quantization_threshold=0` 的透传、cache identity
+和结果摘要均记录在本 README 的结果表中。
+第十轮在同一 patch runtime 上补做了 Python-only public、batch 和 cosine rebenchmark；
+C++ 按要求不纳入。formal 三 precision 的性能表只引用 round-10 arithmetic mean；
+新增的 `int4_causal_vnomask_qkvfused`/`int4_visint8` 只完成 smoke，其中后者的大图
+fused 路径触发 `CL_OUT_OF_RESOURCES`，不作为 accepted deployment precision。
+与最初 baseline 的统一 arithmetic-mean 对比如下：
+INT8 在 1024-token text/query 加速 `1.171x/1.170x`、448x448 image/fused 加速
+`1.732x/1.687x`；INT4 在 1024-token text/query 加速 `1.345x/1.293x`，最早可比
+pre-vopt 448x448 image/fused 加速 `1.224x/1.226x`。document batch=8 的 INT8
+page_text/page_image/page_fused 加速为 `1.150x/2.714x/2.774x`，INT4 为
+`1.269x/2.796x/2.795x`。
+
+MMDocIR 结果不作为本仓库 patch 应用验证的一部分；本 README 只记录可在本仓库源码和
+补丁上复现的 GPU plugin 结果，不依赖外部数据集或另一个仓库的报告文件。
+
+## 收益（Intel Panther Lake-P iGPU，gme-Qwen2-VL-2B-Instruct，INT4，GPU）
+
+`bench_ab.sh` 交替 A/B，stock 2026.3 wheel vs 三个 patch 全开，3 轮取中位：
+
+| tokens | text | query |
+| ---: | ---: | ---: |
+| 32 | 32.78 → 32.19 ms (1.018x) | 32.85 → 32.31 ms (1.017x) |
+| 128 | 46.56 → 40.20 ms (**1.158x**) | 46.24 → 40.17 ms (**1.151x**) |
+| 512 | 146.55 → 123.81 ms (**1.184x**) | 145.49 → 123.31 ms (**1.180x**) |
+| 1024 | 281.38 → 240.01 ms (**1.172x**) | 280.18 → 239.53 ms (**1.170x**) |
+
+32 token 上收益仍只有第一轮的 ~1.02x：opt-3 的 128 行门槛在那里不触发，
+这是**刻意的**——低于该行数时新 layout 反而更慢，因此 opt-3 保留 128 行门槛。
+
+在 Qwen3-VL rank-3 matcher 修复之后复测，收益在噪声范围内不变：
+128 → 1.164x / 1.156x，512 → 1.186x / 1.182x，1024 → 1.170x / 1.167x。
+
+以上表格直接记录该轮的 arithmetic mean；所有速度结论均以 arithmetic mean 为决策指标。
+
+## 第六轮语言收益（opt-4）
+
+`int4_causal_vopt`，3 轮 control/fused 交错 A/B，每轮 warmup=8 / repeat=6。表中是
+18 个 timed calls 的 arithmetic mean：
+
+| tokens | DQ reuse control | + RMS→DQ fused | speedup |
+| ---: | ---: | ---: | ---: |
+| 32 | 40.14 | 38.88 ms | 1.033x |
+| 128 | **46.57** | 47.68 ms | 0.977x |
+| 512 | 124.22 | **120.67 ms** | 1.029x |
+| 1024 | 220.28 | **211.63 ms** | **1.041x** |
+
+DQ reuse 本身把 DQ calls 140→112，约省 1–2 ms，默认可用。RMS fusion 把 1024-token
+的 RMS 57→1 calls、9.04→0.17 ms；129/512/1024 及 padded batch 相对 control
+**逐位相同**。但强制 threshold=0 会让短 query 也量化，query cosine 0.955173→0.948910，
+并且 128 token 有约 2.5% 回归，所以只建议给 512+ token 的独立实例使用，不设默认。
+该结果说明 RMS fusion 只适合 512+ token 的独立实例，默认短 query 仍保持原有 f16 bypass。
+
+## 第七轮视觉收益（opt-5）
+
+INT4，strict control/fused plugin 二进制交错 3 轮；两边都设置 visual threshold=0，
+control 只关闭 MVN matcher。表中是每格 15 个 raw samples 的 arithmetic mean：
+
+| grid | control | fused | speedup |
+| --- | ---: | ---: | ---: |
+| L=1024 | 182.27 | **173.07 ms** | **1.053x** |
+| L=2916（cap=768 logo） | 659.15 | **630.25 ms** | **1.046x** |
+| L=2304 | 477.59 | **453.91 ms** | **1.052x** |
+| L=5040 | 1440.56 | **1390.51 ms** | **1.036x** |
+
+public image/fused 端到端 true mean 在 448x448、672x672、1288x728 上为 **1.027–1.039x**。
+MVN 65→2 calls；四个 grid、真实 public image/fused、compiled-model cache reload 都
+`max_abs=0`。
+
+INT8 visual 使用 `group_size=128 + precomputed_reduction`，不满足 opt-5 的 per-token guard，
+实测 MVN 仍为 65 calls、性能约 1.00x。不要把 INT8 的无收益误算进 opt-5。
+
+## 第八轮 QKV transpose 收益（opt-6）
+
+每格 3 轮 × 5 raw samples 的 arithmetic mean：
+
+| precision / grid | control | opt-6 | speedup | permute mean |
+| --- | ---: | ---: | ---: | ---: |
+| INT4 L=1024 | 172.63 | **169.50 ms** | **1.019x** | 18.14→13.97 ms |
+| INT4 L=2304 | 453.98 | **445.30 ms** | **1.020x** | 42.98→34.07 ms |
+| INT4 L=2916 | 629.78 | **623.24 ms** | **1.011x** | 49.62→41.86 ms |
+| INT4 L=5040 | 1391.70 | **1384.18 ms** | **1.005x** | 86.99→79.48 ms |
+| INT8 L=1024 | 190.55 | **186.80 ms** | **1.020x** | 18.20→13.97 ms |
+| INT8 L=5040 | 1472.27 | **1463.74 ms** | **1.006x** | 90.34→81.71 ms |
+
+INT4 public image/fused true mean 在 448x448、672x672、1288x728 上为 **1.004–1.017x**。
+普通 rank-4 MatMul direct-write 会掉到 `jit:gemm:any__f16`，已否决；INT8 grouped
+MVN→DQ 虽 bit-identical 但 mean latency 回归 1.7–3.7%，也已回退。
+
+## Qwen3-VL-Embedding-2B 适用性复测
+
+三个 patch 都在 `Qwen3-VL-Embedding-2B` 上做了适用性复核。结果不能直接沿用 GME
+的收益结论：
+
+| 路径 | Qwen3 结果 |
+|---|---|
+| INT8 text 512 | 0.997x，基本无收益 |
+| INT8 text 1024 | 1.020x，小幅收益 |
+| INT4 text 512 | 0.991x，小幅回归 |
+| INT4 text 1024 | 1.013x，小幅收益 |
+| image/fused（2026-08-13 版 opt-2） | optimized plugin 在 64x64 后触发 `CL_OUT_OF_RESOURCES` / `FullyConnectedCompressed` 实现选择失败 |
+| opt-3 增量（INT8 text 1024） | 359.73 → 359.34 ms，1.0011x，基本无收益 |
+| opt-3 增量（INT4 text 1024） | 351.04 → 350.76 ms，1.0008x，基本无收益 |
+
+opt-3 对 Qwen3 language text 不触发：`hidden=2048`、`intermediate=6144`，
+`N/K=3 < 4`，不满足 `N >= 4K`。
+
+**2026-08-17 更新**：上表 image/fused 那一行的崩溃已定位并修复，根因是 opt-2 的
+matcher 会覆盖已融合的输入 transpose order，加上三处 rank-3 / 静态 shape 路径的
+既有缺陷。
+修复后 `Qwen3-VL-Embedding-2B` 的 text / image / fused 共 28 个 workload
+（INT8 + INT4）与 stock **逐位相同**——vision tower 是 rank-3 SDPA，matcher 现在会
+主动跳过它。也就是说这三个 patch 现在对 Qwen3-VL **既不损害也不加速**（text 侧的
+±2% 属于测量噪声），可以安全共存于同一个 plugin 里。
+
+stock/optimized 的核心结论已直接写入上表；本仓库不要求额外 JSON 或外部报告文件。
+
+## 上游建议
+
+前两处都是通用缺陷，建议分别提 PR：
+
+1. **opt-1** — `UnsqueezeBroadcastReshapeSDPAFusion` 的 pattern 把 K/V producer 限定
+   为 `KVCache`，导致无状态 GQA 模型漏掉 `repeat_kv` 消除。融合的全部前提条件在
+   callback 里已有检查，producer 类型不携带信息，可安全放开。
+2. **opt-2** — 两件事：(a) `TransposeFusion` 缺少 SDPA 输出侧的 matcher（MatMul 两侧
+   都有）；(b) `sdpa_gen_micro` 按位置读输出 layout 的 batch/num_heads，对非默认
+   `output_transpose_order` 是错的 —— 这是个**已存在但此前无人触发**的 bug，
+   (a) 一旦合入就会立刻暴露它。建议 (b) 可以先独立合入。
+3. **opt-3** — 提 PR 前需要先谈清两点，不建议按现在的形态直接上游：
+   - **阈值是实测拟合的，不是推导出来的。** `N ≥ 4K` 和 `≥128 行` 两个常数来自
+   Panther Lake iGPU 上的逐 matmul 计时，换 GPU 代次
+     或换 driver 后不保证还在同一位置。上游更合适的形态是把它做成
+     `jit:gemm` 侧的 layout 偏好查询，而不是 plugin 侧硬编码常数。
+   - **附带的 `oiyx → ioyx` INT4 reorder 是通用能力，可以先独立合入。**
+     `reorder_weights_int4` 此前不支持这条转换路径；补上它（kernel + selector
+     的三处）本身不改变任何现有行为，已用 host readback 验证逐 nibble 位正确。
