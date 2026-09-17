@@ -1,0 +1,42 @@
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
+index 2832561235..c6965a6c60 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
+@@ -7,7 +7,12 @@
+ #include "include/batch_headers/sub_group_block_write.cl"
+ 
+ // Check alignment restrictions for using block writes on output.
+-#define USE_BLOCK_WRITE ((OUTPUT_TYPE_SIZE * OUTPUT_FEATURE_PITCH) & 0xF == 0)
++// NOTE: `&` binds *looser* than `==` in C, so the original
++//     ((OUTPUT_TYPE_SIZE * OUTPUT_FEATURE_PITCH) & 0xF == 0)
++// parsed as `(...) & (0xF == 0)` == `(...) & 0` == 0, i.e. it was
++// unconditionally false and the block-write path below was dead code for every
++// shape. The parentheses restore the intended 16-byte alignment test.
++#define USE_BLOCK_WRITE (((OUTPUT_TYPE_SIZE * OUTPUT_FEATURE_PITCH) & 0xF) == 0)
+ 
+ #if SUBGROUP_BLOCK_SIZE == 1
+ #define BLOCK_READ(ptr, offset) DT_INPUT_BLOCK_READ(ptr, offset)
+@@ -76,7 +81,13 @@ KERNEL(rms_gpu_bfyx_opt)(
+     __local ACCUMULATOR_TYPE slm_buf[SLM_SIZE];
+ 
+     uint i = 0;
+-    if (workers_per_data > SUB_GROUP_SIZE)
++    // A single full sub-group (workers_per_data == SUB_GROUP_SIZE) can use the
++    // vectorized block reads just as well as several of them: subgroup_offset is
++    // 0, and BLOCK_READ<N> covers N * SUB_GROUP_SIZE contiguous elements, which
++    // is exactly one row. Requiring strictly more than one sub-group pushed every
++    // normalization over a short axis (e.g. Qwen3's 128-wide q_norm/k_norm, which
++    // yield LWS == 16) onto the scalar fallback below.
++    if (workers_per_data >= SUB_GROUP_SIZE)
+     {
+         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
+         {
+@@ -155,7 +166,7 @@ KERNEL(rms_gpu_bfyx_opt)(
+     #endif
+ 
+     i = 0;
+-    if ((workers_per_data > SUB_GROUP_SIZE) && USE_BLOCK_WRITE)
++    if ((workers_per_data >= SUB_GROUP_SIZE) && USE_BLOCK_WRITE)
+     {
+         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
+         {
