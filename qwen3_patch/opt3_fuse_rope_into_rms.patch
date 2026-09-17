@@ -1,0 +1,452 @@
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
+@@ -35,6 +35,10 @@
+ #if ELEMENTWISE_AFFINE
+     const __global INPUT1_TYPE* gamma,
+ #endif
++#if FUSED_ROPE
++    const __global INPUT2_TYPE* rope_cos,
++    const __global INPUT3_TYPE* rope_sin,
++#endif
+     __global OUTPUT_TYPE* output
+     #if HAS_FUSED_OPS_DECLS
+         , FUSED_OPS_DECLS
+@@ -165,12 +169,49 @@
+         #endif
+     #endif
+ 
++#if FUSED_ROPE
++    // Fold the RotateHalf RoPE that used to follow this normalization into the
++    // epilogue, so the [tokens, heads, head_size] activation is read and written
++    // once instead of twice.
++    //
++    // fuse_rope_into_rms() only folds when one sub-group owns a whole row and
++    // SUBGROUP_BLOCK_SIZE == items_num, i.e. data[j] is the element at
++    // r = j*SUB_GROUP_SIZE + lane. ROPE_HALF_ROTARY_NDIMS is then exactly
++    // (SUBGROUP_BLOCK_SIZE/2)*SUB_GROUP_SIZE, so the RoPE partner of element j
++    // is element j + SUBGROUP_BLOCK_SIZE/2 *in the same lane* -- the rotation
++    // needs no cross-lane shuffle, and cos/sin come in with one block read each.
++    //
++    // The arithmetic below reproduces rope_opt.cl exactly: the value is rounded
++    // to OUTPUT_TYPE first (that is what the standalone RoPE used to read back
++    // from memory) and the rotation itself is evaluated in the input type.
++    {
++        const uint rope_token = data_idx / ROPE_HEAD_COUNT;
++        const uint rope_base = rope_token * (ROPE_HALF_ROTARY_NDIMS * 2);
++        ACC_TYPE vec_gamma_r = TO_ACC_TYPE(BLOCK_READ(gamma, 0));
++        OUTPUT_VEC_TYPE vec_norm;
++        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
++            vec_norm[j] = TO_OUTPUT_TYPE(rms * data[j] * vec_gamma_r[j]);
++        }
++
++        OUTPUT_VEC_TYPE vec_cos = BLOCK_READ(rope_cos, rope_base);
++        OUTPUT_VEC_TYPE vec_sin = BLOCK_READ(rope_sin, rope_base);
++
++        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE / 2; j++) {
++            const int j2 = j + SUBGROUP_BLOCK_SIZE / 2;
++            const OUTPUT_TYPE x1 = vec_norm[j];
++            const OUTPUT_TYPE x2 = vec_norm[j2];
++            data[j]  = TO_ACCUMULATOR_TYPE(vec_cos[j]  * x1 - vec_sin[j]  * x2);
++            data[j2] = TO_ACCUMULATOR_TYPE(vec_cos[j2] * x2 + vec_sin[j2] * x1);
++        }
++    }
++#endif
++
+     i = 0;
+     if ((workers_per_data >= SUB_GROUP_SIZE) && USE_BLOCK_WRITE)
+     {
+         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
+         {
+-    #if ELEMENTWISE_AFFINE && !SCALAR_GAMMA
++    #if ELEMENTWISE_AFFINE && !SCALAR_GAMMA && !FUSED_ROPE
+             ACC_TYPE vec_gamma = TO_ACC_TYPE(BLOCK_READ(gamma, subgroup_offset + i * get_sub_group_size()));
+ #endif
+             OUTPUT_VEC_TYPE vec_tmp;
+@@ -192,7 +233,10 @@
+             vec_tmp = normalized;
+ #else
+             unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
+-#if ELEMENTWISE_AFFINE && SCALAR_GAMMA
++#if FUSED_ROPE
++                // data[] already holds the normalized *and* rotated value.
++                OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i + j]);
++#elif ELEMENTWISE_AFFINE && SCALAR_GAMMA
+                 OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i + j] * scalar_gamma);
+ #elif ELEMENTWISE_AFFINE
+                 OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i + j] * vec_gamma[j]);
+@@ -213,7 +257,9 @@
+ 
+     for (; i < items_num; i++)
+     {
+-    #if ELEMENTWISE_AFFINE && SCALAR_GAMMA
++    #if FUSED_ROPE
++        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i]);
++    #elif ELEMENTWISE_AFFINE && SCALAR_GAMMA
+         OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i] * scalar_gamma);
+     #elif ELEMENTWISE_AFFINE
+         ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[subgroup_offset + get_sub_group_local_id() + i * get_sub_group_size()]);
+--- a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
++++ b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+@@ -17,6 +17,10 @@
+ #include "lrn_inst.h"
+ #include "mvn_inst.h"
+ #include "rms_inst.h"
++#include "rope_inst.h"
++#include "reshape_inst.h"
++#include <cstdlib>
++#include <cstdio>
+ #include "pooling_inst.h"
+ #include "normalize_inst.h"
+ #include "permute_inst.h"
+@@ -88,6 +92,7 @@
+     fuse_simple_primitives(p);
+     fuse_constant_transposes(p);
+     optimize_fused_ops(p);
++    fuse_rope_into_rms(p);
+ }
+ 
+ static std::optional<size_t> find_eltwise_const_dep_idx(const eltwise_node& node) {
+@@ -199,6 +204,195 @@
+     }
+ }
+ 
++
++// Fold `rms -> rope` (RotateHalf) into a single rms that rotates in its epilogue.
++//
++// Why. Qwen3 normalizes per attention head and then immediately rotates the same
++// [tokens, heads, head_size] tensor, so the activation is streamed twice for two
++// cheap elementwise passes. Both kernels sit at the DRAM ceiling on an iGPU, so
++// their cost is the bytes they move: read x / write normalized, then read
++// normalized / write rotated. Folding removes the middle tensor entirely.
++//
++// The fold is only legal for the plain RotateHalf form and only when the RMS
++// dispatch gives one sub-group per row with SUBGROUP_BLOCK_SIZE == items_num.
++// rms_gpu_bfyx_opt picks lws so that each work item handles ~8 elements, so a
++// head_size of SUB_GROUP_SIZE * 8 == 128 yields lws == 16 (one sub-group) and
++// items_num == SUBGROUP_BLOCK_SIZE == 8. Under exactly that shape, data[j] is
++// the element at j*SUB_GROUP_SIZE + lane, so RoPE's partner element j + 4 lives
++// in the same lane and no cross-lane exchange is needed. Any other head_size is
++// left alone.
++void prepare_primitive_fusing::fuse_rope_into_rms(program& p) {
++    if (std::getenv("OV_DISABLE_ROPE_RMS_FUSION"))
++        return;
++    auto itr = p.get_processing_order().begin();
++    while (itr != p.get_processing_order().end()) {
++        auto node = *itr++;
++        if (!node->is_type<rope>() || node->is_output())
++            continue;
++
++        auto& rope_node = node->as<rope>();
++        auto rope_prim = rope_node.get_primitive();
++        const auto& cfg = rope_prim->config;
++
++        // Plain RotateHalf only: no model-specific variant, no gather, no slice,
++        // no transpose, and the rotation must cover the whole head.
++        if (cfg.is_qwen || cfg.is_chatglm || cfg.is_ltx_video || cfg.is_interleaved ||
++            cfg.input_trans0213 || cfg.output_trans0213 || cfg.support_2d_rope || cfg.support_3d_rope)
++            continue;
++        if (rope_prim->gather_rank > 0 || cfg.slice_stop > cfg.slice_start)
++            continue;
++        if (cfg.head_size != 0 && cfg.head_size != cfg.rotary_ndims)
++            continue;
++        // cos/sin are indexed with a single offset in the folded kernel, which
++        // requires the "second half" offset to be exactly half the rotation.
++        if (cfg.rotary_ndims == 0 || (cfg.rotary_ndims % 2) != 0)
++            continue;
++        const size_t half_rotary = cfg.rotary_ndims / 2;
++        const size_t cos_sin_offset = (cfg.cos_sin_ndims == half_rotary) ? 0 : half_rotary;
++        if (cos_sin_offset != half_rotary)
++            continue;
++        // data[j] <-> data[j + SUBGROUP_BLOCK_SIZE/2] pairing, see the comment above.
++        constexpr size_t kSubGroupSize = 16;
++        constexpr size_t kItemsPerWorkItem = 8;
++        if (cfg.rotary_ndims != kSubGroupSize * kItemsPerWorkItem)
++            continue;
++        if (rope_node.has_fused_primitives() || rope_node.get_dependencies().size() != 3)
++            continue;
++
++        // The graph keeps a rank-fixing Reshape between the normalization and the
++        // rotation. It is a no-op in memory (it never touches the innermost axis),
++        // so walk through any chain of single-user Reshapes to find the rms.
++        program_node* producer = &rope_node.get_dependency(0);
++        bool reshape_chain_ok = true;
++        while (producer->is_type<reshape>()) {
++            if (producer->get_users().size() != 1 || producer->is_output() ||
++                producer->get_output_layout().data_padding ||
++                producer->get_input_layouts()[0].data_padding) {
++                reshape_chain_ok = false;
++                break;
++            }
++            const auto rs_in = producer->get_input_layouts()[0].get_partial_shape();
++            const auto rs_out = producer->get_output_layout().get_partial_shape();
++            if (rs_in.rank().is_dynamic() || rs_out.rank().is_dynamic() || rs_in.size() == 0 || rs_out.size() == 0 ||
++                rs_in[rs_in.size() - 1].is_dynamic() || rs_out[rs_out.size() - 1].is_dynamic() ||
++                rs_in[rs_in.size() - 1] != rs_out[rs_out.size() - 1]) {
++                reshape_chain_ok = false;
++                break;
++            }
++            producer = &producer->get_dependency(0);
++        }
++        if (!reshape_chain_ok)
++            continue;
++
++        auto& rms_node = *producer;
++        if (!rms_node.is_type<rms>() || rms_node.is_output() || rms_node.get_users().size() != 1 ||
++            rms_node.has_fused_primitives())
++            continue;
++
++        auto rms_prim = std::const_pointer_cast<rms>(rms_node.as<rms>().get_primitive());
++        if (rms_prim->fused_rope || !rms_prim->elementwise_affine || rms_node.get_dependencies().size() != 2)
++            continue;
++
++        // Everything stays f16: the kernel block-reads cos/sin with the INPUT0
++        // reader and evaluates the rotation in the input type to match rope_opt.
++        const auto in_layout = rms_node.get_input_layouts()[0];
++        const auto gamma_layout = rms_node.get_input_layouts()[1];
++        const auto cos_layout = rope_node.get_input_layouts()[1];
++        const auto sin_layout = rope_node.get_input_layouts()[2];
++        const auto out_layout = rope_node.get_output_layout();
++        if (in_layout.data_type != data_types::f16 || gamma_layout.data_type != data_types::f16 ||
++            cos_layout.data_type != data_types::f16 || sin_layout.data_type != data_types::f16 ||
++            rms_node.get_output_layout().data_type != data_types::f16 || out_layout.data_type != data_types::f16)
++            continue;
++        if (in_layout.format != format::bfyx || out_layout.format != format::bfyx)
++            continue;
++
++        // The normalized axis has to be the innermost one and match the rotation,
++        // and gamma has to cover it exactly (it is block-read as one row).
++        const auto in_pshape = in_layout.get_partial_shape();
++        if (in_pshape.rank().is_dynamic() || in_pshape.size() < 2)
++            continue;
++        const auto& last_dim = in_pshape[in_pshape.size() - 1];
++        if (last_dim.is_dynamic() || static_cast<size_t>(last_dim.get_length()) != cfg.rotary_ndims)
++            continue;
++        if (gamma_layout.is_dynamic() || gamma_layout.count() != cfg.rotary_ndims)
++            continue;
++
++        // The kernel recovers the token index as row_index / head_count, where the
++        // row index enumerates every [.., head_size] row in layout order. The heads
++        // are therefore *all* the axes between the batch and the normalized one --
++        // Qwen3 lands them in Y (e.g. [tokens, 1, 16, 128]), not in F -- so the head
++        // count is their product, and every one of them has to be static.
++        if (in_pshape.size() < 3)
++            continue;
++        size_t head_count = 1;
++        bool head_dims_static = true;
++        for (size_t i = 1; i + 1 < in_pshape.size(); i++) {
++            if (in_pshape[i].is_dynamic()) {
++                head_dims_static = false;
++                break;
++            }
++            head_count *= static_cast<size_t>(in_pshape[i].get_length());
++        }
++        if (!head_dims_static || head_count == 0)
++            continue;
++        // Rows are addressed flat as data_idx * data_size, so padding would break
++        // the row -> offset mapping the fused epilogue relies on.
++        if (in_layout.data_padding || out_layout.data_padding)
++            continue;
++
++        // cos/sin are read as cos[token * rotary_ndims + r], so the table must be
++        // one contiguous row per token.
++        // The tables are indexed cos[token * rotary_ndims + r], so only the
++        // innermost axis has to be known; the token count may stay dynamic. Every
++        // outer axis must be 1 so that rows are contiguous and one row per token.
++        auto cos_sin_row_ok = [&](const layout& l) {
++            if (l.data_padding)
++                return false;
++            const auto ps = l.get_partial_shape();
++            if (ps.rank().is_dynamic() || ps.size() == 0)
++                return false;
++            if (ps[ps.size() - 1].is_dynamic() ||
++                static_cast<size_t>(ps[ps.size() - 1].get_length()) != cfg.rotary_ndims)
++                return false;
++            for (size_t i = 1; i + 1 < ps.size(); i++) {
++                if (ps[i].is_dynamic() || ps[i].get_length() != 1)
++                    return false;
++            }
++            return true;
++        };
++        if (!cos_sin_row_ok(cos_layout) || !cos_sin_row_ok(sin_layout))
++            continue;
++        if (cos_layout.format != format::bfyx || sin_layout.format != format::bfyx)
++            continue;
++
++        auto& cos_node = rope_node.get_dependency(1);
++        auto& sin_node = rope_node.get_dependency(2);
++
++        rms_prim->fused_rope = true;
++        rms_prim->rope_half_rotary_ndims = half_rotary;
++        rms_prim->rope_cos_sin_table_offset = cos_sin_offset;
++        rms_prim->rope_head_count = head_count;
++        rms_prim->input.push_back(input_info(cos_node.id()));
++        rms_prim->input.push_back(input_info(sin_node.id()));
++
++        p.add_connection(cos_node, rms_node);
++        p.add_connection(sin_node, rms_node);
++
++        // program::extract() bypasses a node by wiring its single dependency to
++        // its users and refuses outright when there is more than one, so the
++        // cos/sin edges have to go first -- they now belong to the rms.
++        p.remove_connection(cos_node, rope_node);
++        p.remove_connection(sin_node, rope_node);
++        const bool removed = p.extract_and_remove(rope_node);
++        OPENVINO_ASSERT(removed, "[fuse_rope_into_rms] failed to remove ", rope_node.id(),
++                        " after folding it into ", rms_prim->id);
++        rms_node.recalc_output_layouts(false);
++
++        GPU_DEBUG_TRACE << "[fuse_rope_into_rms] folded " << rope_prim->id << " into " << rms_prim->id << std::endl;
++    }
++}
++
+ void prepare_primitive_fusing::fuse_swiglu(program &p) {
+     bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(p.get_config().get_disable_fc_swiglu_fusion(), false);
+     // Apply only for high performant GPU
+--- a/src/plugins/intel_gpu/src/graph/include/pass_manager.h
++++ b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
+@@ -156,6 +156,7 @@
+     void fuse_reorders(program& p);
+     void fuse_simple_primitives(program &p);
+     void fuse_constant_transposes(program &p);
++    void fuse_rope_into_rms(program &p);
+     void optimize_fused_ops(program &p);
+     void remove_redundant_reshape(program &p);
+ };
+--- a/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
+@@ -43,10 +43,24 @@
+     /// @brief A boolean value that when set to True, RMS has learnable affine parameters (gamma)
+     bool elementwise_affine;
+ 
++    /// @brief When true this primitive also applies the RotateHalf RoPE that used to
++    /// follow it, taking cos/sin as inputs 2 and 3. See fuse_rope_into_rms().
++    bool fused_rope = false;
++    /// @brief Half of the RoPE rotary dimension count (RoPE pairs r with r + this).
++    size_t rope_half_rotary_ndims = 0;
++    /// @brief Offset added to the cos/sin index for the second half of the rotation.
++    size_t rope_cos_sin_table_offset = 0;
++    /// @brief Number of attention heads, used to recover the token index from the row index.
++    size_t rope_head_count = 0;
++
+     size_t hash() const override {
+         size_t seed = primitive::hash();
+         seed = hash_combine(seed, epsilon);
+         seed = hash_combine(seed, elementwise_affine);
++        seed = hash_combine(seed, fused_rope);
++        seed = hash_combine(seed, rope_half_rotary_ndims);
++        seed = hash_combine(seed, rope_cos_sin_table_offset);
++        seed = hash_combine(seed, rope_head_count);
+         return seed;
+     }
+ 
+@@ -57,19 +71,31 @@
+         auto rhs_casted = downcast<const rms>(rhs);
+ 
+         return epsilon == rhs_casted.epsilon &&
+-               elementwise_affine == rhs_casted.elementwise_affine;
++               elementwise_affine == rhs_casted.elementwise_affine &&
++               fused_rope == rhs_casted.fused_rope &&
++               rope_half_rotary_ndims == rhs_casted.rope_half_rotary_ndims &&
++               rope_cos_sin_table_offset == rhs_casted.rope_cos_sin_table_offset &&
++               rope_head_count == rhs_casted.rope_head_count;
+     }
+ 
+     void save(BinaryOutputBuffer& ob) const override {
+         primitive_base<rms>::save(ob);
+         ob << epsilon;
+         ob << elementwise_affine;
++        ob << fused_rope;
++        ob << rope_half_rotary_ndims;
++        ob << rope_cos_sin_table_offset;
++        ob << rope_head_count;
+     }
+ 
+     void load(BinaryInputBuffer& ib) override {
+         primitive_base<rms>::load(ib);
+         ib >> epsilon;
+         ib >> elementwise_affine;
++        ib >> fused_rope;
++        ib >> rope_half_rotary_ndims;
++        ib >> rope_cos_sin_table_offset;
++        ib >> rope_head_count;
+     }
+ };
+ }  // namespace cldnn
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
+@@ -118,6 +118,14 @@
+     }
+     jit.AddConstant(MakeJitConstant("SUB_GROUP_SIZE", subgroup_size));
+     jit.AddConstant(MakeJitConstant("SUBGROUP_BLOCK_SIZE", dispatchData.subgroupBlockSize));
++    if (params.fused_rope) {
++        jit.AddConstants({
++            MakeJitConstant("FUSED_ROPE", 1),
++            MakeJitConstant("ROPE_HALF_ROTARY_NDIMS", params.rope_half_rotary_ndims),
++            MakeJitConstant("ROPE_COS_SIN_TABLE_OFFSET", params.rope_cos_sin_table_offset),
++            MakeJitConstant("ROPE_HEAD_COUNT", params.rope_head_count)
++        });
++    }
+     if (!params.fused_ops.empty()) {
+         jit.AddConstant(MakeJitConstant("LAST_DIM", GetNormalizationAxisName(normalization_axis)));
+ 
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
+@@ -46,6 +46,12 @@
+ }
+ 
+ KernelsData RMSKernelRef::GetKernelsData(const Params& params) const {
++    // Only rms_gpu_bfyx_opt implements the folded RoPE epilogue. The reference
++    // kernel must refuse such a node rather than silently emit an un-rotated
++    // result -- fuse_rope_into_rms() mirrors bfyx_opt's preconditions so this
++    // should never be the last remaining candidate.
++    if (static_cast<const rms_params&>(params).fused_rope)
++        return {};
+     return GetCommonKernelsData(params);
+ }
+ 
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
+@@ -15,6 +15,12 @@
+     float epsilon = 0.0f;
+     int32_t ov_input_rank = -1;
+     bool elementwise_affine = true;
++    // RotateHalf RoPE folded into the normalization epilogue; cos/sin are the
++    // last two entries of `inputs`. See fuse_rope_into_rms().
++    bool fused_rope = false;
++    size_t rope_half_rotary_ndims = 0;
++    size_t rope_cos_sin_table_offset = 0;
++    size_t rope_head_count = 0;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
+@@ -104,7 +104,10 @@
+     GetUpdateDispatchDataFunc(kd);
+ 
+     auto& kernel = kd.kernels[0];
++    // input [+ gamma] [+ cos + sin when the RoPE epilogue is folded in]
+     auto inputs_count = orgParams.elementwise_affine ? 2 : 1;
++    if (orgParams.fused_rope)
++        inputs_count += 2;
+     FillCLKernelData(kernel,
+                      dispatchData,
+                      params.engineInfo,
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp
+@@ -42,6 +42,15 @@
+         params.epsilon = primitive->epsilon;
+         params.ov_input_rank = static_cast<int32_t>(impl_param.get_input_layout().get_partial_shape().size());
+         params.elementwise_affine = primitive->elementwise_affine;
++        params.fused_rope = primitive->fused_rope;
++        if (primitive->fused_rope) {
++            // cos and sin follow the (mandatory) gamma input.
++            params.inputs.push_back(convert_data_tensor(impl_param.get_input_layout(2)));
++            params.inputs.push_back(convert_data_tensor(impl_param.get_input_layout(3)));
++            params.rope_half_rotary_ndims = primitive->rope_half_rotary_ndims;
++            params.rope_cos_sin_table_offset = primitive->rope_cos_sin_table_offset;
++            params.rope_head_count = primitive->rope_head_count;
++        }
+         return params;
+     }
+ 
