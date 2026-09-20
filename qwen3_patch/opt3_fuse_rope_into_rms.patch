@@ -1,90 +1,67 @@
---- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
-+++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
-@@ -35,6 +35,10 @@
- #if ELEMENTWISE_AFFINE
-     const __global INPUT1_TYPE* gamma,
- #endif
-+#if FUSED_ROPE
-+    const __global INPUT2_TYPE* rope_cos,
-+    const __global INPUT3_TYPE* rope_sin,
-+#endif
-     __global OUTPUT_TYPE* output
-     #if HAS_FUSED_OPS_DECLS
-         , FUSED_OPS_DECLS
-@@ -165,12 +169,49 @@
-         #endif
-     #endif
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp b/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
+index 1f1f126674..2e33a47d5f 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
+@@ -43,10 +43,24 @@ struct rms : public primitive_base<rms> {
+     /// @brief A boolean value that when set to True, RMS has learnable affine parameters (gamma)
+     bool elementwise_affine;
  
-+#if FUSED_ROPE
-+    // Fold the RotateHalf RoPE that used to follow this normalization into the
-+    // epilogue, so the [tokens, heads, head_size] activation is read and written
-+    // once instead of twice.
-+    //
-+    // fuse_rope_into_rms() only folds when one sub-group owns a whole row and
-+    // SUBGROUP_BLOCK_SIZE == items_num, i.e. data[j] is the element at
-+    // r = j*SUB_GROUP_SIZE + lane. ROPE_HALF_ROTARY_NDIMS is then exactly
-+    // (SUBGROUP_BLOCK_SIZE/2)*SUB_GROUP_SIZE, so the RoPE partner of element j
-+    // is element j + SUBGROUP_BLOCK_SIZE/2 *in the same lane* -- the rotation
-+    // needs no cross-lane shuffle, and cos/sin come in with one block read each.
-+    //
-+    // The arithmetic below reproduces rope_opt.cl exactly: the value is rounded
-+    // to OUTPUT_TYPE first (that is what the standalone RoPE used to read back
-+    // from memory) and the rotation itself is evaluated in the input type.
-+    {
-+        const uint rope_token = data_idx / ROPE_HEAD_COUNT;
-+        const uint rope_base = rope_token * (ROPE_HALF_ROTARY_NDIMS * 2);
-+        ACC_TYPE vec_gamma_r = TO_ACC_TYPE(BLOCK_READ(gamma, 0));
-+        OUTPUT_VEC_TYPE vec_norm;
-+        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
-+            vec_norm[j] = TO_OUTPUT_TYPE(rms * data[j] * vec_gamma_r[j]);
-+        }
++    /// @brief When true this primitive also applies the RotateHalf RoPE that used to
++    /// follow it, taking cos/sin as inputs 2 and 3. See fuse_rope_into_rms().
++    bool fused_rope = false;
++    /// @brief Half of the RoPE rotary dimension count (RoPE pairs r with r + this).
++    size_t rope_half_rotary_ndims = 0;
++    /// @brief Offset added to the cos/sin index for the second half of the rotation.
++    size_t rope_cos_sin_table_offset = 0;
++    /// @brief Number of attention heads, used to recover the token index from the row index.
++    size_t rope_head_count = 0;
 +
-+        OUTPUT_VEC_TYPE vec_cos = BLOCK_READ(rope_cos, rope_base);
-+        OUTPUT_VEC_TYPE vec_sin = BLOCK_READ(rope_sin, rope_base);
-+
-+        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE / 2; j++) {
-+            const int j2 = j + SUBGROUP_BLOCK_SIZE / 2;
-+            const OUTPUT_TYPE x1 = vec_norm[j];
-+            const OUTPUT_TYPE x2 = vec_norm[j2];
-+            data[j]  = TO_ACCUMULATOR_TYPE(vec_cos[j]  * x1 - vec_sin[j]  * x2);
-+            data[j2] = TO_ACCUMULATOR_TYPE(vec_cos[j2] * x2 + vec_sin[j2] * x1);
-+        }
-+    }
-+#endif
-+
-     i = 0;
-     if ((workers_per_data >= SUB_GROUP_SIZE) && USE_BLOCK_WRITE)
-     {
-         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
-         {
--    #if ELEMENTWISE_AFFINE && !SCALAR_GAMMA
-+    #if ELEMENTWISE_AFFINE && !SCALAR_GAMMA && !FUSED_ROPE
-             ACC_TYPE vec_gamma = TO_ACC_TYPE(BLOCK_READ(gamma, subgroup_offset + i * get_sub_group_size()));
- #endif
-             OUTPUT_VEC_TYPE vec_tmp;
-@@ -192,7 +233,10 @@
-             vec_tmp = normalized;
- #else
-             unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
--#if ELEMENTWISE_AFFINE && SCALAR_GAMMA
-+#if FUSED_ROPE
-+                // data[] already holds the normalized *and* rotated value.
-+                OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i + j]);
-+#elif ELEMENTWISE_AFFINE && SCALAR_GAMMA
-                 OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i + j] * scalar_gamma);
- #elif ELEMENTWISE_AFFINE
-                 OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i + j] * vec_gamma[j]);
-@@ -213,7 +257,9 @@
+     size_t hash() const override {
+         size_t seed = primitive::hash();
+         seed = hash_combine(seed, epsilon);
+         seed = hash_combine(seed, elementwise_affine);
++        seed = hash_combine(seed, fused_rope);
++        seed = hash_combine(seed, rope_half_rotary_ndims);
++        seed = hash_combine(seed, rope_cos_sin_table_offset);
++        seed = hash_combine(seed, rope_head_count);
+         return seed;
+     }
  
-     for (; i < items_num; i++)
-     {
--    #if ELEMENTWISE_AFFINE && SCALAR_GAMMA
-+    #if FUSED_ROPE
-+        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i]);
-+    #elif ELEMENTWISE_AFFINE && SCALAR_GAMMA
-         OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i] * scalar_gamma);
-     #elif ELEMENTWISE_AFFINE
-         ACCUMULATOR_TYPE temp = TO_ACCUMULATOR_TYPE(gamma[subgroup_offset + get_sub_group_local_id() + i * get_sub_group_size()]);
+@@ -57,19 +71,31 @@ struct rms : public primitive_base<rms> {
+         auto rhs_casted = downcast<const rms>(rhs);
+ 
+         return epsilon == rhs_casted.epsilon &&
+-               elementwise_affine == rhs_casted.elementwise_affine;
++               elementwise_affine == rhs_casted.elementwise_affine &&
++               fused_rope == rhs_casted.fused_rope &&
++               rope_half_rotary_ndims == rhs_casted.rope_half_rotary_ndims &&
++               rope_cos_sin_table_offset == rhs_casted.rope_cos_sin_table_offset &&
++               rope_head_count == rhs_casted.rope_head_count;
+     }
+ 
+     void save(BinaryOutputBuffer& ob) const override {
+         primitive_base<rms>::save(ob);
+         ob << epsilon;
+         ob << elementwise_affine;
++        ob << fused_rope;
++        ob << rope_half_rotary_ndims;
++        ob << rope_cos_sin_table_offset;
++        ob << rope_head_count;
+     }
+ 
+     void load(BinaryInputBuffer& ib) override {
+         primitive_base<rms>::load(ib);
+         ib >> epsilon;
+         ib >> elementwise_affine;
++        ib >> fused_rope;
++        ib >> rope_half_rotary_ndims;
++        ib >> rope_cos_sin_table_offset;
++        ib >> rope_head_count;
+     }
+ };
+ }  // namespace cldnn
+diff --git a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+index 4886979f6f..832590ae5d 100644
 --- a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
 +++ b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
 @@ -17,6 +17,10 @@
@@ -98,7 +75,7 @@
  #include "pooling_inst.h"
  #include "normalize_inst.h"
  #include "permute_inst.h"
-@@ -88,6 +92,7 @@
+@@ -88,6 +92,7 @@ void prepare_primitive_fusing::run(program& p) {
      fuse_simple_primitives(p);
      fuse_constant_transposes(p);
      optimize_fused_ops(p);
@@ -106,7 +83,7 @@
  }
  
  static std::optional<size_t> find_eltwise_const_dep_idx(const eltwise_node& node) {
-@@ -199,6 +204,195 @@
+@@ -199,6 +204,195 @@ void prepare_primitive_fusing::fuse_reorders(program &p) {
      }
  }
  
@@ -302,139 +279,11 @@
  void prepare_primitive_fusing::fuse_swiglu(program &p) {
      bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(p.get_config().get_disable_fc_swiglu_fusion(), false);
      // Apply only for high performant GPU
---- a/src/plugins/intel_gpu/src/graph/include/pass_manager.h
-+++ b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
-@@ -156,6 +156,7 @@
-     void fuse_reorders(program& p);
-     void fuse_simple_primitives(program &p);
-     void fuse_constant_transposes(program &p);
-+    void fuse_rope_into_rms(program &p);
-     void optimize_fused_ops(program &p);
-     void remove_redundant_reshape(program &p);
- };
---- a/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
-+++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/rms.hpp
-@@ -43,10 +43,24 @@
-     /// @brief A boolean value that when set to True, RMS has learnable affine parameters (gamma)
-     bool elementwise_affine;
- 
-+    /// @brief When true this primitive also applies the RotateHalf RoPE that used to
-+    /// follow it, taking cos/sin as inputs 2 and 3. See fuse_rope_into_rms().
-+    bool fused_rope = false;
-+    /// @brief Half of the RoPE rotary dimension count (RoPE pairs r with r + this).
-+    size_t rope_half_rotary_ndims = 0;
-+    /// @brief Offset added to the cos/sin index for the second half of the rotation.
-+    size_t rope_cos_sin_table_offset = 0;
-+    /// @brief Number of attention heads, used to recover the token index from the row index.
-+    size_t rope_head_count = 0;
-+
-     size_t hash() const override {
-         size_t seed = primitive::hash();
-         seed = hash_combine(seed, epsilon);
-         seed = hash_combine(seed, elementwise_affine);
-+        seed = hash_combine(seed, fused_rope);
-+        seed = hash_combine(seed, rope_half_rotary_ndims);
-+        seed = hash_combine(seed, rope_cos_sin_table_offset);
-+        seed = hash_combine(seed, rope_head_count);
-         return seed;
-     }
- 
-@@ -57,19 +71,31 @@
-         auto rhs_casted = downcast<const rms>(rhs);
- 
-         return epsilon == rhs_casted.epsilon &&
--               elementwise_affine == rhs_casted.elementwise_affine;
-+               elementwise_affine == rhs_casted.elementwise_affine &&
-+               fused_rope == rhs_casted.fused_rope &&
-+               rope_half_rotary_ndims == rhs_casted.rope_half_rotary_ndims &&
-+               rope_cos_sin_table_offset == rhs_casted.rope_cos_sin_table_offset &&
-+               rope_head_count == rhs_casted.rope_head_count;
-     }
- 
-     void save(BinaryOutputBuffer& ob) const override {
-         primitive_base<rms>::save(ob);
-         ob << epsilon;
-         ob << elementwise_affine;
-+        ob << fused_rope;
-+        ob << rope_half_rotary_ndims;
-+        ob << rope_cos_sin_table_offset;
-+        ob << rope_head_count;
-     }
- 
-     void load(BinaryInputBuffer& ib) override {
-         primitive_base<rms>::load(ib);
-         ib >> epsilon;
-         ib >> elementwise_affine;
-+        ib >> fused_rope;
-+        ib >> rope_half_rotary_ndims;
-+        ib >> rope_cos_sin_table_offset;
-+        ib >> rope_head_count;
-     }
- };
- }  // namespace cldnn
---- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
-+++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
-@@ -118,6 +118,14 @@
-     }
-     jit.AddConstant(MakeJitConstant("SUB_GROUP_SIZE", subgroup_size));
-     jit.AddConstant(MakeJitConstant("SUBGROUP_BLOCK_SIZE", dispatchData.subgroupBlockSize));
-+    if (params.fused_rope) {
-+        jit.AddConstants({
-+            MakeJitConstant("FUSED_ROPE", 1),
-+            MakeJitConstant("ROPE_HALF_ROTARY_NDIMS", params.rope_half_rotary_ndims),
-+            MakeJitConstant("ROPE_COS_SIN_TABLE_OFFSET", params.rope_cos_sin_table_offset),
-+            MakeJitConstant("ROPE_HEAD_COUNT", params.rope_head_count)
-+        });
-+    }
-     if (!params.fused_ops.empty()) {
-         jit.AddConstant(MakeJitConstant("LAST_DIM", GetNormalizationAxisName(normalization_axis)));
- 
---- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
-+++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
-@@ -46,6 +46,12 @@
- }
- 
- KernelsData RMSKernelRef::GetKernelsData(const Params& params) const {
-+    // Only rms_gpu_bfyx_opt implements the folded RoPE epilogue. The reference
-+    // kernel must refuse such a node rather than silently emit an un-rotated
-+    // result -- fuse_rope_into_rms() mirrors bfyx_opt's preconditions so this
-+    // should never be the last remaining candidate.
-+    if (static_cast<const rms_params&>(params).fused_rope)
-+        return {};
-     return GetCommonKernelsData(params);
- }
- 
---- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
-+++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
-@@ -15,6 +15,12 @@
-     float epsilon = 0.0f;
-     int32_t ov_input_rank = -1;
-     bool elementwise_affine = true;
-+    // RotateHalf RoPE folded into the normalization epilogue; cos/sin are the
-+    // last two entries of `inputs`. See fuse_rope_into_rms().
-+    bool fused_rope = false;
-+    size_t rope_half_rotary_ndims = 0;
-+    size_t rope_cos_sin_table_offset = 0;
-+    size_t rope_head_count = 0;
- };
- 
- ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
---- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
-+++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
-@@ -104,7 +104,10 @@
-     GetUpdateDispatchDataFunc(kd);
- 
-     auto& kernel = kd.kernels[0];
-+    // input [+ gamma] [+ cos + sin when the RoPE epilogue is folded in]
-     auto inputs_count = orgParams.elementwise_affine ? 2 : 1;
-+    if (orgParams.fused_rope)
-+        inputs_count += 2;
-     FillCLKernelData(kernel,
-                      dispatchData,
-                      params.engineInfo,
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp
+index 315aeeee25..3b2e60bf2b 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl/rms.cpp
-@@ -42,6 +42,15 @@
+@@ -42,6 +42,15 @@ struct rms_impl : typed_primitive_impl_ocl<rms> {
          params.epsilon = primitive->epsilon;
          params.ov_input_rank = static_cast<int32_t>(impl_param.get_input_layout().get_partial_shape().size());
          params.elementwise_affine = primitive->elementwise_affine;
@@ -449,4 +298,164 @@
 +        }
          return params;
      }
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/include/pass_manager.h b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
+index 658e242ea9..50f5bfbd92 100644
+--- a/src/plugins/intel_gpu/src/graph/include/pass_manager.h
++++ b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
+@@ -159,6 +159,7 @@ private:
+     void fuse_reorders(program& p);
+     void fuse_simple_primitives(program& p);
+     void fuse_constant_transposes(program& p);
++    void fuse_rope_into_rms(program& p);
+     void optimize_fused_ops(program& p);
+     void remove_redundant_reshape(program& p);
+ };
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
+index 852ab4934f..4243f018dc 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
+@@ -35,6 +35,10 @@ KERNEL(rms_gpu_bfyx_opt)(
+     const __global INPUT0_TYPE* input,
+ #if ELEMENTWISE_AFFINE
+     const __global INPUT1_TYPE* gamma,
++#endif
++#if FUSED_ROPE
++    const __global INPUT2_TYPE* rope_cos,
++    const __global INPUT3_TYPE* rope_sin,
+ #endif
+     __global OUTPUT_TYPE* output
+     #if HAS_FUSED_OPS_DECLS
+@@ -166,15 +170,39 @@ KERNEL(rms_gpu_bfyx_opt)(
+         #endif
+     #endif
+ 
++#if FUSED_ROPE
++    // Fold the RotateHalf RoPE that used to follow this normalization into the
++    // epilogue, so the [tokens, heads, head_size] activation is read and written
++    // once instead of twice.
++    {
++        const uint rope_token = data_idx / ROPE_HEAD_COUNT;
++        const uint rope_base = rope_token * (ROPE_HALF_ROTARY_NDIMS * 2);
++        ACC_TYPE vec_gamma_r = TO_ACC_TYPE(BLOCK_READ(gamma, 0));
++        OUTPUT_VEC_TYPE vec_norm;
++        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
++            vec_norm[j] = TO_OUTPUT_TYPE(rms * data[j] * vec_gamma_r[j]);
++        }
++
++        OUTPUT_VEC_TYPE vec_cos = BLOCK_READ(rope_cos, rope_base);
++        OUTPUT_VEC_TYPE vec_sin = BLOCK_READ(rope_sin, rope_base);
++
++        unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE / 2; j++) {
++            const int j2 = j + SUBGROUP_BLOCK_SIZE / 2;
++            const OUTPUT_TYPE x1 = vec_norm[j];
++            const OUTPUT_TYPE x2 = vec_norm[j2];
++            data[j] = TO_ACCUMULATOR_TYPE(vec_cos[j] * x1 - vec_sin[j] * x2);
++            data[j2] = TO_ACCUMULATOR_TYPE(vec_cos[j2] * x2 + vec_sin[j2] * x1);
++        }
++    }
++#endif
++
+     i = 0;
+     if ((workers_per_data >= SUB_GROUP_SIZE) && USE_BLOCK_WRITE)
+     {
+         for (; i < items_num - (items_num % SUBGROUP_BLOCK_SIZE); i += SUBGROUP_BLOCK_SIZE)
+         {
+-#if ELEMENTWISE_AFFINE
+-#if !RMS_GAMMA_IS_SCALAR
++#if ELEMENTWISE_AFFINE && !RMS_GAMMA_IS_SCALAR && !FUSED_ROPE
+             ACC_TYPE vec_gamma = TO_ACC_TYPE(BLOCK_READ(gamma, subgroup_offset + i * get_sub_group_size()));
+-#endif
+ #endif
+             OUTPUT_VEC_TYPE vec_tmp;
+             #if HAS_FUSED_OPS
+@@ -197,7 +225,9 @@ KERNEL(rms_gpu_bfyx_opt)(
+             vec_tmp = normalized;
+ #else
+             unroll_for (int j = 0; j < SUBGROUP_BLOCK_SIZE; j++) {
+-#if ELEMENTWISE_AFFINE
++#if FUSED_ROPE
++                OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i + j]);
++#elif ELEMENTWISE_AFFINE
+ #if RMS_GAMMA_IS_SCALAR
+                 OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i + j] * gamma_scalar);
+ #else
+@@ -220,7 +250,9 @@ KERNEL(rms_gpu_bfyx_opt)(
+ 
+     for (; i < items_num; i++)
+     {
+-#if ELEMENTWISE_AFFINE
++#if FUSED_ROPE
++        OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(data[i]);
++#elif ELEMENTWISE_AFFINE
+     #if RMS_GAMMA_IS_SCALAR
+         OUTPUT_TYPE normalized = TO_OUTPUT_TYPE(rms * data[i] * gamma_scalar);
+     #else
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
+index 23b17fa164..fc8ac89c48 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.cpp
+@@ -111,7 +111,10 @@ KernelsData RMSKernelBase::GetCommonKernelsData(const Params& params) const {
+     GetUpdateDispatchDataFunc(kd);
+ 
+     auto& kernel = kd.kernels[0];
++    // input [+ gamma] [+ cos + sin when the RoPE epilogue is folded in]
+     auto inputs_count = orgParams.elementwise_affine ? 2 : 1;
++    if (orgParams.fused_rope)
++        inputs_count += 2;
+     FillCLKernelData(kernel,
+                      dispatchData,
+                      params.engineInfo,
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
+index 369fe611e5..41e6e8bd09 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_base.h
+@@ -15,6 +15,12 @@ struct rms_params : public base_params {
+     float epsilon = 0.0f;
+     int32_t ov_input_rank = -1;
+     bool elementwise_affine = true;
++    // RotateHalf RoPE folded into the normalization epilogue; cos/sin are the
++    // last two entries of `inputs`. See fuse_rope_into_rms().
++    bool fused_rope = false;
++    size_t rope_half_rotary_ndims = 0;
++    size_t rope_cos_sin_table_offset = 0;
++    size_t rope_head_count = 0;
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
+index 5030f2861d..bc414411db 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_bfyx_opt.cpp
+@@ -120,6 +120,14 @@ JitConstants RMSKernelBfyxOpt::GetJitConstants(const rms_params& params, Dispatc
+     }
+     jit.AddConstant(MakeJitConstant("SUB_GROUP_SIZE", subgroup_size));
+     jit.AddConstant(MakeJitConstant("SUBGROUP_BLOCK_SIZE", dispatchData.subgroupBlockSize));
++    if (params.fused_rope) {
++        jit.AddConstants({
++            MakeJitConstant("FUSED_ROPE", 1),
++            MakeJitConstant("ROPE_HALF_ROTARY_NDIMS", params.rope_half_rotary_ndims),
++            MakeJitConstant("ROPE_COS_SIN_TABLE_OFFSET", params.rope_cos_sin_table_offset),
++            MakeJitConstant("ROPE_HEAD_COUNT", params.rope_head_count)
++        });
++    }
+     if (!params.fused_ops.empty()) {
+         switch (params.ov_input_rank) {
+             case 1 :
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
+index e6f693bb81..4119c0d93a 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/rms/rms_kernel_ref.cpp
+@@ -48,6 +48,12 @@ JitConstants RMSKernelRef::GetJitConstants(const rms_params& params, DispatchDat
+ }
+ 
+ KernelsData RMSKernelRef::GetKernelsData(const Params& params) const {
++    // Only rms_gpu_bfyx_opt implements the folded RoPE epilogue. The reference
++    // kernel must refuse such a node rather than silently emit an un-rotated
++    // result -- fuse_rope_into_rms() mirrors bfyx_opt's preconditions so this
++    // should never be the last remaining candidate.
++    if (static_cast<const rms_params&>(params).fused_rope)
++        return {};
+     return GetCommonKernelsData(params);
+ }
  

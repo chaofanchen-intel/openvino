@@ -1,16 +1,12 @@
 diff --git a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
-index 4d4442d4e8..5284f07ea2 100644
+index 4fd8a86c38..ad69ecd090 100644
 --- a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
 +++ b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
-@@ -24,11 +24,21 @@ static bool should_skip_execution(const dynamic_quantize_node& node, const layou
+@@ -24,8 +24,18 @@ static bool should_skip_execution(const dynamic_quantize_node& node, const layout& act_layout, const dynamic_quantize::Attributes& attrs) {
          || !act_layout.is_static())
          return false;
  
--    // Do not skip dynamic quantization if next node is not fully connected.(such as SDPA)
--    OPENVINO_ASSERT(node.get_users().size() == node.get_outputs_count(),
--                    "Dynamic quantization is supposed to have only one user-node with duplicated connection: ", node.id());
--    if (!(*node.get_users().begin())->is_type<fully_connected>())
--        return false;
+-    // Do not skip dynamic quantization if any user node is not fully connected.(such as SDPA)
 +    // Normally a DynamicQuantize feeds exactly one FullyConnected, which consumes every
 +    // DQ output (quantized data + scale[+zp]), so users.size() == outputs_count.
 +    // When several FullyConnected that share the same activation reuse a single DQ
@@ -22,15 +18,12 @@ index 4d4442d4e8..5284f07ea2 100644
 +    const size_t outs = node.get_outputs_count();
 +    OPENVINO_ASSERT(outs > 0 && node.get_users().size() % outs == 0,
 +                    "Dynamic quantization users are not a whole multiple of its outputs: ", node.id());
-+    for (const auto& u : node.get_users()) {
-+        if (!u->is_type<fully_connected>())
-+            return false;
-+    }
- 
-     // If batch size is 1, dynamic_quantize is disabled for performance reason
-     size_t input_batch = act_layout.batch();
+     for (const auto& user : node.get_users()) {
+         if (!user->is_type<fully_connected>())
+             return false;
+     }
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp b/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
-index 58ed3e3834..c28be9c40b 100644
+index 09c5a18557..0be479b464 100644
 --- a/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
 +++ b/src/plugins/intel_gpu/src/plugin/transformations/dynamic_quantize_fully_connected.cpp
 @@ -18,6 +18,31 @@
@@ -65,7 +58,7 @@ index 58ed3e3834..c28be9c40b 100644
  // precomputed_reduction is providing partial reduction of activation from dynamic quantization into onednn for faster computation
  // It is used for asymmetric weight.
  DynamicQuantizeFullyConnected::DynamicQuantizeFullyConnected(uint64_t group_size,
-@@ -116,7 +141,13 @@ DynamicQuantizeFullyConnected::DynamicQuantizeFullyConnected(uint64_t group_size
+@@ -116,6 +141,12 @@ DynamicQuantizeFullyConnected::DynamicQuantizeFullyConnected(uint64_t group_size
              config.zp_dt = element::u8; // it supports u8 only now
          }
  
@@ -79,4 +72,3 @@ index 58ed3e3834..c28be9c40b 100644
 +        }
  
          int dyn_quan_output_idx = 2;
-         auto optional_a_zp = config.quantization_type == QuantizationType::Symmetric ?

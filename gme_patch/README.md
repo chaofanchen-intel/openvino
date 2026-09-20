@@ -2,18 +2,18 @@
 
 ## Base
 
-所有 patch 均基于 **OpenVINO 官方 release tag `2026.3.1`**：
+所有 patch 均基于 **OpenVINO 2026.4 release branch**：
 
 ```
-commit 759c5a6ab8c066af5f4bc5ebd04643706012a37d (tag: 2026.3.1)
+commit 0fc8e3f241f02434ec480c04ae19c86470918bc0 (upstream/releases/2026/4)
 ```
 
 补丁只包含 Intel GPU plugin 的 GME 优化，不包含其他模型优化或 benchmark 工具的改动。
-每个 patch 都是相对于本仓库 `2026.3.1` 基线的源码差异。
+每个 patch 都是相对于本仓库 `2026.4_base` 基线的源码差异。
 
-已在纯净 `2026.3.1` checkout 上验证过
+已在纯净 `2026.4_base` checkout 上验证过
 `git apply` 通过（单独 apply、顺序 apply、合并 apply 三种方式都验证）。
-2026.3.1 在 `dynamic_quantize.hpp` 中新增了 `innermost_size` 状态；opt-4/opt-5
+2026.4 在 `dynamic_quantize.hpp` 中保留了 `innermost_size` 状态；opt-4/opt-5
 的 `fused_rms`/`fused_mvn` 字段已按新的序列化、比较和 hash 布局重新生成，未修改
 优化逻辑。
 
@@ -35,7 +35,7 @@ commit 759c5a6ab8c066af5f4bc5ebd04643706012a37d (tag: 2026.3.1)
 前三个 patch 相互独立，可单独 apply；但 **opt-2 单独用时依赖它自带的运行时修复**
 （否则一旦融合触发就会 GPU 挂死），这些修复已包含在 opt-2 内。
 
-opt-4 也可从纯净 `2026.3.1` 单独 apply，或者顺序 apply 在
+opt-4 也可从纯净 `2026.4_base` 单独 apply，或者顺序 apply 在
 `all_gme_int4_gpu_opts.patch` 之后。两种方式以及新的 round-6 combined patch 都已在
 detached clean tag worktree 上通过 `git apply --check`。opt-4 里的 DQ reuse 默认生效；
 RMS→DQ 融合只有显式设置 `GPU_DYNAMIC_QUANTIZATION_THRESHOLD=0` 才生效，默认短 query
@@ -56,7 +56,7 @@ vision 路径触发 `CL_OUT_OF_RESOURCES`。本目录只保留已修复的 opt-2
 ## 应用
 
 ```bash
-git checkout 2026.3.1            # 或任何 src/ 与该 tag 一致的 checkout
+git checkout 2026.4_base         # 或任何 src/ 与该 release-branch tip 一致的 checkout
 git apply gme_patch/all_gme_int4_gpu_opts.patch
 
 cmake --build <build-dir> --target openvino_intel_gpu_plugin -j

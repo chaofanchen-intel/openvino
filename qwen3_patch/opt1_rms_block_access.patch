@@ -2,8 +2,9 @@ diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_o
 index 2832561235..c6965a6c60 100644
 --- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
 +++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/rms_gpu_bfyx_opt.cl
-@@ -7,7 +7,12 @@
+@@ -7,8 +7,13 @@
  #include "include/batch_headers/sub_group_block_write.cl"
+ #include "include/batch_headers/bf16_utils.cl"
  
  // Check alignment restrictions for using block writes on output.
 -#define USE_BLOCK_WRITE ((OUTPUT_TYPE_SIZE * OUTPUT_FEATURE_PITCH) & 0xF == 0)

@@ -1,5 +1,5 @@
 diff --git a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
-index a64fc77650b192ec252a4942ec0650f38bde4976..fb739d8cfa5aaae5ef609a8aa668e206990f87d6 100644
+index 4886979f6f..fb33009ca6 100644
 --- a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
 +++ b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
 @@ -45,6 +45,7 @@
@@ -10,7 +10,7 @@ index a64fc77650b192ec252a4942ec0650f38bde4976..fb739d8cfa5aaae5ef609a8aa668e206
  #include <vector>
  #include <map>
  #include <list>
-@@ -851,6 +852,16 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
+@@ -840,6 +841,16 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
  
              should_fuse |= input.is_type<rms>();
  
@@ -28,7 +28,7 @@ index a64fc77650b192ec252a4942ec0650f38bde4976..fb739d8cfa5aaae5ef609a8aa668e206
  
              should_fuse |= input.is_type<normalize>() && data_type_traits::is_i8_u8(input.get_input_layout(0).data_type);
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
-index fee97a801754dc315416d88c04f94eeb44592be4..a0052e29682d0aa66c38abe9b2a5f207456f1d03 100644
+index 492cf94fca..f6be5fee58 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
 @@ -36,6 +36,32 @@
@@ -64,7 +64,7 @@ index fee97a801754dc315416d88c04f94eeb44592be4..a0052e29682d0aa66c38abe9b2a5f207
  KERNEL(paged_causal_conv1d_ref)
  (__global INPUT0_TYPE* input_embeds,
   __global INPUT1_TYPE* conv_state_table,
-@@ -152,7 +178,7 @@ KERNEL(paged_causal_conv1d_ref)
+@@ -173,7 +199,7 @@ KERNEL(paged_causal_conv1d_ref)
          }
  
          const int out_off = token_idx * output_token_stride + h * output_hidden_stride;
@@ -74,18 +74,18 @@ index fee97a801754dc315416d88c04f94eeb44592be4..a0052e29682d0aa66c38abe9b2a5f207
          const int cached_tokens = prev_nums + (t + 1);
          const int interval_hit = (seq_interval > 0) && ((cached_tokens % seq_interval) == 0);
 diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
-index d8da15f3d427e7f33edfb0e739121c61cf1bea8d..09ab43d77cb4b77ba835e854dd98db0f92fcc478 100644
+index 02e0c45c8c..e41276d99b 100644
 --- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
 +++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
-@@ -8,6 +8,7 @@
- #include <cstdio>
+@@ -9,6 +9,7 @@
  #include <cstdlib>
+ #include <limits>
  
 +#include "intel_gpu/primitives/activation.hpp"
  #include "intel_gpu/primitives/paged_causal_conv1d.hpp"
  #include "primitive_ocl_base.hpp"
  #include "utils/kernel_generator.hpp"
-@@ -32,6 +33,20 @@ protected:
+@@ -63,6 +64,20 @@ protected:
          jit.make("KERNEL_SIZE", static_cast<int>(state_shape[2].get_length()));
          jit.make("HAS_BIAS", has_bias ? 1 : 0);
  
@@ -108,7 +108,7 @@ index d8da15f3d427e7f33edfb0e739121c61cf1bea8d..09ab43d77cb4b77ba835e854dd98db0f
  
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a04e8c881d99fda9f2a30c27130262df3db1668
+index 0000000000..2a04e8c881
 --- /dev/null
 +++ b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp
 @@ -0,0 +1,76 @@
@@ -190,7 +190,7 @@ index 0000000000000000000000000000000000000000..2a04e8c881d99fda9f2a30c27130262d
 +}  // namespace ov::intel_gpu
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c6677f73e34e2177b0da432c05405867b890240b
+index 0000000000..c6677f73e3
 --- /dev/null
 +++ b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp
 @@ -0,0 +1,35 @@
@@ -230,18 +230,18 @@ index 0000000000000000000000000000000000000000..c6677f73e34e2177b0da432c05405867
 +
 +}  // namespace ov::intel_gpu
 diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
-index 9a098deb653c7a101ce3278f4396c3ab1b04417d..39fcd844a12391cfb00b7110812f1f7c7e1dd474 100644
+index 53f683c6b5..05d40be8d5 100644
 --- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
 +++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
-@@ -111,6 +111,7 @@
+@@ -115,6 +115,7 @@
  #include "plugin/transformations/print_model_statistics.hpp"
  #include "plugin/transformations/reduce_fc_dimensions.hpp"
  #include "plugin/transformations/sink_reshape.hpp"
 +#include "plugin/transformations/move_swish_up_through_reshape.hpp"
  #include "plugin/transformations/transpose_fusion.hpp"
+ #include "plugin/transformations/sdpa_transpose_fusion.hpp"
  #include "plugin/transformations/unsqueeze_broadcast_reshape_matmul_fusion.hpp"
- #include "plugin/transformations/unsqueeze_broadcast_reshape_sdpa_fusion.hpp"
-@@ -1674,6 +1675,15 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+@@ -1693,6 +1694,15 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
  
          manager.register_pass<ov::intel_gpu::SinkReshape>();
  

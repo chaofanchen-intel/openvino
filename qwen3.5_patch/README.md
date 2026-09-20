@@ -7,15 +7,16 @@ Intel integrated GPUs.
 
 ## Base
 
-These patches were regenerated against the clean OpenVINO official release tag
-`2026.3.1`:
+These patches were regenerated against a clean OpenVINO 2026.4 release-branch
+checkout:
 
 ```
-759c5a6ab8c066af5f4bc5ebd04643706012a37d (tag: 2026.3.1)
+0fc8e3f241f02434ec480c04ae19c86470918bc0 (upstream/releases/2026/4)
 ```
 
-Each patch and the documented patch chain were replayed on a clean
-`2026.3.1` checkout with `git apply`.
+Each patch and the documented patch chains were replayed on a clean
+`2026.4_base` checkout with `git apply`. Performance tables below retain
+historical 2026.3 measurements unless stated otherwise.
 
 Optimizations **opt-1 … opt-5** were validated to be **byte-identical** in output (128-token
 greedy-decode `result_md5` multiset unchanged vs. the unpatched baseline). They change

@@ -11,9 +11,10 @@ Qwen3 graph does not contain.
 
 ## Base
 
-Patches are generated against this repository's OpenVINO checkout at release tag
-`2026.3.1` (`759c5a6ab8c066af5f4bc5ebd04643706012a37d`) and apply with `git apply`
-to a pristine tree.
+Patches are generated against this repository's OpenVINO 2026.4 release-branch
+tip `0fc8e3f241f02434ec480c04ae19c86470918bc0` (`upstream/releases/2026/4`,
+release tag `2026.4.0`) and apply with `git apply` to a pristine `2026.4_base`
+tree.
 
 ```bash
 git apply qwen3_patch/opt1_rms_block_access.patch
@@ -31,7 +32,7 @@ rebuild via `OV_DISABLE_ROPE_RMS_FUSION=1` (used for A/B).
 | | |
 |---|---|
 | GPU | Intel Graphics iGPU, Pantherlake-P, 32 XVE x 10 threads, 2.45 GHz, XMX present |
-| Runtime | OpenVINO + GenAI 2026.3.1, `ATTENTION_BACKEND=PA` (the `LLMPipeline` default) |
+| Runtime | OpenVINO + GenAI 2026.4, `ATTENTION_BACKEND=PA` (the `LLMPipeline` default) |
 | Workload | 1000-token cold prefill, batch 1, greedy, `-ic 1` |
 | Models | Qwen3-0.6B and Qwen3-1.7B, FP32 / INT8 / INT4-g128 / INT4-channel-wise |
 | Driver | `model_bench llm` (C++), prompt permutation ON |
@@ -39,7 +40,7 @@ rebuild via `OV_DISABLE_ROPE_RMS_FUSION=1` (used for A/B).
 Prompt permutation must stay ON. PA's latency scheduler enables prefix caching,
 so a repeated identical prompt is answered from cached KV blocks and reports a
 TTFT that never ran a prefill — this silently understated every previously
-recorded TTFT by 3-5x. The current baseline-first source comparison is recorded
+recorded TTFT by 3-5x. The historical baseline-first source comparison is recorded
 in
 [`Qwen3-Optimization/docs/results.md`](../../../Qwen3-Optimization/docs/results.md).
 
@@ -203,7 +204,7 @@ and plugin hashes in its `metadata.json`.
 
 | Run | Patch measured | Baseline is |
 |---|---|---|
-| [`cold_ttft_patch_compare_20260913`](../../../Qwen3-Optimization/results/cold_ttft_patch_compare_20260913/) | opt-1 | pristine 2026.3.1 |
+| [`cold_ttft_patch_compare_20260913`](../../../Qwen3-Optimization/results/cold_ttft_patch_compare_20260913/) | opt-1 | historical pristine 2026.3.1 |
 | [`opt2_dq_reuse_20260913`](../../../Qwen3-Optimization/results/opt2_dq_reuse_20260913/) | opt-2 | opt-1 applied |
 | [`opt3_rope_rms_20260915`](../../../Qwen3-Optimization/results/opt3_rope_rms_20260915/) | opt-3 | opt-1 + opt-2 applied |
 
@@ -234,7 +235,7 @@ does what it claims.
 
 The formal all-precision stack run is
 [`opt123_all_precisions_fp16_20260915`](../../../Qwen3-Optimization/results/opt123_all_precisions_fp16_20260915/).
-It measures pristine 2026.3.1 first, then applies opt-1, opt-2, and opt-3 as
+The historical run measured pristine 2026.3.1 first, then applied opt-1, opt-2, and opt-3 as
 one stack:
 
 | Model | Variant | pristine mean | opt-1+2+3 mean | total |
