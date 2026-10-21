@@ -16,7 +16,7 @@ Patches are generated against OpenVINO 2026.4.1 release tag
 pristine `2026.4_base` tree.
 
 Compatibility checks are recorded in
-[VALIDATION_2026.4.1.md](../VALIDATION_2026.4.1.md).
+[VALIDATION_2026.4.1.md](https://github.com/chaofanchen-intel/openvino/blob/2026.4_base/benchmark/openvino/VALIDATION_2026.4.1.md).
 
 ```bash
 git apply qwen3_patch/opt1_rms_block_access.patch
