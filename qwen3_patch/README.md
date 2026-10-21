@@ -11,10 +11,12 @@ Qwen3 graph does not contain.
 
 ## Base
 
-Patches are generated against this repository's OpenVINO 2026.4 release-branch
-tip `0fc8e3f241f02434ec480c04ae19c86470918bc0` (`upstream/releases/2026/4`,
-release tag `2026.4.0`) and apply with `git apply` to a pristine `2026.4_base`
-tree.
+Patches are generated against OpenVINO 2026.4.1 release tag
+`e213a14725769a6a2bf86fc86650aa78a9c05d3e` and apply with `git apply` to a
+pristine `2026.4_base` tree.
+
+Compatibility checks are recorded in
+[VALIDATION_2026.4.1.md](../VALIDATION_2026.4.1.md).
 
 ```bash
 git apply qwen3_patch/opt1_rms_block_access.patch

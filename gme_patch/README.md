@@ -2,18 +2,20 @@
 
 ## Base
 
-所有 patch 均基于 **OpenVINO 2026.4 release branch**：
+所有 patch 均基于 **OpenVINO 2026.4.1 release tag**：
 
 ```
-commit 0fc8e3f241f02434ec480c04ae19c86470918bc0 (upstream/releases/2026/4)
+commit e213a14725769a6a2bf86fc86650aa78a9c05d3e (tag: 2026.4.1)
 ```
+
+兼容性验证结果见 [VALIDATION_2026.4.1.md](../VALIDATION_2026.4.1.md)。
 
 补丁只包含 Intel GPU plugin 的 GME 优化，不包含其他模型优化或 benchmark 工具的改动。
 每个 patch 都是相对于本仓库 `2026.4_base` 基线的源码差异。
 
 已在纯净 `2026.4_base` checkout 上验证过
 `git apply` 通过（单独 apply、顺序 apply、合并 apply 三种方式都验证）。
-2026.4 在 `dynamic_quantize.hpp` 中保留了 `innermost_size` 状态；opt-4/opt-5
+2026.4.1 在 `dynamic_quantize.hpp` 中保留了 `innermost_size` 状态；opt-4/opt-5
 的 `fused_rms`/`fused_mvn` 字段已按新的序列化、比较和 hash 布局重新生成，未修改
 优化逻辑。
 
@@ -56,7 +58,7 @@ vision 路径触发 `CL_OUT_OF_RESOURCES`。本目录只保留已修复的 opt-2
 ## 应用
 
 ```bash
-git checkout 2026.4_base         # 或任何 src/ 与该 release-branch tip 一致的 checkout
+git checkout 2026.4_base         # 或任何 src/ 与 2026.4.1 tag 一致的 checkout
 git apply gme_patch/all_gme_int4_gpu_opts.patch
 
 cmake --build <build-dir> --target openvino_intel_gpu_plugin -j
