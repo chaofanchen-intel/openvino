@@ -1,0 +1,36 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
+index b866d0de69..57d7aa0721 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/sdpa_gen_micro.cpp
+@@ -808,6 +808,14 @@ sdpa_config_t* choose_config_xe2(int head_size, int seq, bool thin_q, bool quant
+     }
+     return choose_config_xehpc(head_size, seq, thin_q, quantized, is_integrated, is_pa, is_prefill);
+ }
++
++// Paged-attention prefill, head size 128, integrated Xe3: the PVC-derived xehpc_h128 tile (128 queries x 256 keys per
++// 32-subgroup work group) leaves a 4-Xe-core part with ~128 coarse work groups. A 32-query x 128-key tile on 8
++// subgroups gives the scheduler 4x more, smaller work groups and measured -4 to -5 ms of Qwen3-0.6B prefill.
++// The 128-key tile changes the online-softmax accumulation order versus the 256-key tile, so results agree to rounding
++// but are not bit-identical. {16, 64, 32, 16, 16, 1, 4, 4} keeps the 256-key tile (bit-exact) for about 60% of the gain.
++sdpa_config_t xe3_h128_pa_prefill_integrated = {16, 32, 32, 16, 8, 1, 4, 2};
++
+ sdpa_config_t* choose_config_xe3p(int head_size, int seq, bool thin_q, bool quantized, bool is_integrated, bool is_pa, bool is_prefill) {
+     if (head_size <= 128) {
+         return &xe3_h128;
+@@ -1555,9 +1563,15 @@ void SDPAMicroGenerator::init_microkernels(const kernel_impl_params& params,
+         break;
+     }
+     case gpu_arch::xe2:
+-    case gpu_arch::xe3:
+         config = choose_config_xe2(static_cast<int32_t>(k_head_size), nkeys_v, thin_q, is_quantized, is_integrated, is_paged_attention, is_prefill);
+         break;
++    case gpu_arch::xe3:
++        if (is_integrated && is_paged_attention && is_prefill && !is_quantized && k_head_size == 128 && v_head_size == 128) {
++            config = &xe3_h128_pa_prefill_integrated;
++        } else {
++            config = choose_config_xe2(static_cast<int32_t>(k_head_size), nkeys_v, thin_q, is_quantized, is_integrated, is_paged_attention, is_prefill);
++        }
++        break;
+     case gpu_arch::xe3p:
+         config = choose_config_xe3p(static_cast<int32_t>(k_head_size), nkeys_v, thin_q, is_quantized, is_integrated, is_paged_attention, is_prefill);
+         break;

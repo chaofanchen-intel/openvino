@@ -1,0 +1,130 @@
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
+index a9b34f6710..77f666fab9 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/pa_kv_cache_update_ref.cl
+@@ -4,10 +4,18 @@
+ 
+ #include "include/batch_headers/common.cl"
+ #include "include/batch_headers/sub_group_block_read.cl"
++#include "include/batch_headers/sub_group_block_write.cl"
+ #include "include/batch_headers/int4_utils.cl"
+ 
+ #define UINT4_RANGE 15
+ 
++// PA_KV_VEC_BLOCK (set by the host together with a doubled dispatch along heads): uncompressed cache with a
++// 16-token block. Prefill then uses one sub-group per (block, kv head, key|value) and writes full blocks with
++// vector stores instead of per-element scalar stores.
++#ifndef PA_KV_VEC_BLOCK
++#define PA_KV_VEC_BLOCK 0
++#endif
++
+ inline void FUNC(quantize_and_save_per_token)(__global const INPUT0_TYPE* in_data,
+                                     const uint in_data_offset,
+                                     __global OUTPUT_TYPE* out_data,
+@@ -506,7 +514,12 @@ KERNEL(pa_kv_cache_update)(
+     } else {
+         // 1st token
+         const uint block_idx = get_global_id(0);
++#if PA_KV_VEC_BLOCK
++        const uint head_idx = get_global_id(1) / 2;
++        const bool is_value_part = (get_global_id(1) & 1) != 0;
++#else
+         const uint head_idx = get_global_id(1);
++#endif
+         const uint sglid = get_global_id(2);
+ 
+         const uint subsequence_idx = gws_seq_indexes_correspondence[block_idx];
+@@ -551,6 +564,10 @@ KERNEL(pa_kv_cache_update)(
+         value_out_offset += token_start_pos_val * phys_v_head_size;
+ #endif
+ 
++#if PA_KV_VEC_BLOCK
++        if (is_value_part && tokens_num != PAGED_ATTENTION_BLOCK_SIZE)
++            return;  // partial blocks are handled entirely by the key sub-group
++#endif
+         if (tokens_num == PAGED_ATTENTION_BLOCK_SIZE) {
+         // block is full
+         #if defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL)
+@@ -621,6 +638,37 @@ KERNEL(pa_kv_cache_update)(
+             }
+             #endif
+         #else // !(defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL))
++#if PA_KV_VEC_BLOCK
++            {
++                // Full block, uncompressed cache. Instead of one scalar store per element, transpose the
++                // block in registers so every lane writes the 16 tokens of one key channel as a single
++                // 32-byte vector, and copy the value rows with sub-group block writes.
++                #define PA_K_CHUNK 4
++                #define PA_KV_BLOCK_VEC MAKE_VECTOR_TYPE(OUTPUT_TYPE, PAGED_ATTENTION_BLOCK_SIZE)
++                if (!is_value_part) {
++                for (uint c = 0; c < K_HEAD_SIZE; c += SUBGROUP_SIZE * PA_K_CHUNK) {
++                    PA_KV_BLOCK_VEC k_t[PA_K_CHUNK];
++                    unroll_for (uint t = 0; t < PAGED_ATTENTION_BLOCK_SIZE; t++) {
++                        MAKE_VECTOR_TYPE(INPUT0_TYPE, PA_K_CHUNK) row = BLOCK_READN(INPUT0_TYPE, PA_K_CHUNK, key_data, key_in_offset + t * KEY_IN_STRIDE + c);
++                        unroll_for (uint i = 0; i < PA_K_CHUNK; i++) {
++                            k_t[i][t] = row[i];
++                        }
++                    }
++                    unroll_for (uint i = 0; i < PA_K_CHUNK; i++) {
++                        *(__global PA_KV_BLOCK_VEC*)(key_cache_data + key_out_offset + (c + sglid + SUBGROUP_SIZE * i) * PAGED_ATTENTION_BLOCK_SIZE) = k_t[i];
++                    }
++                }
++                } else {
++                #define PA_V_CHUNK 8
++                for (uint c = 0; c < V_HEAD_SIZE; c += SUBGROUP_SIZE * PA_V_CHUNK) {
++                    unroll_for (uint t = 0; t < PAGED_ATTENTION_BLOCK_SIZE; t++) {
++                        MAKE_VECTOR_TYPE(INPUT1_TYPE, PA_V_CHUNK) row = BLOCK_READN(INPUT1_TYPE, PA_V_CHUNK, value_data, value_in_offset + t * VAL_IN_STRIDE + c);
++                        BLOCK_WRITEN(OUTPUT1_TYPE, PA_V_CHUNK, value_cache_data, value_out_offset + t * V_HEAD_SIZE + c, row);
++                    }
++                }
++                }
++            }
++#else
+             unroll_for (uint token_num = 0; token_num < PAGED_ATTENTION_BLOCK_SIZE; token_num++) {
+             #if !IS_KV_COMPRESSED
+             {
+@@ -763,6 +811,7 @@ KERNEL(pa_kv_cache_update)(
+                 value_out_offset += phys_v_head_size;
+ #endif
+             }
++#endif // PA_KV_VEC_BLOCK
+         #endif // !(defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL))
+         } else {
+         #if defined(IS_KV_COMPRESSED) && defined(IS_KEY_BY_CHANNEL)
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+index 622e512709..4398d41106 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/sdpa/paged_attention_opt.cpp
+@@ -942,6 +942,14 @@ public:
+     KVCacheUpdateGenerator() : KernelGenerator("pa_kv_cache_update_ref") {}
+ 
+ protected:
++    // Uncompressed cache with 16-token blocks and 64/128-aligned head sizes: prefill writes whole blocks with vector
++    // stores, one sub-group per (block, kv head, key|value). Must match PA_KV_VEC_BLOCK in the kernel.
++    static bool use_vector_block_update(const kernel_impl_params& params) {
++        const auto desc = params.typed_desc<paged_attention>();
++        return !get_kv_compressed(params) && paged_attention_block_size == 16 && subgroup_size == 16 && desc->k_head_size % 64 == 0 &&
++               desc->v_head_size % 128 == 0;
++    }
++
+     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
+         auto jit = make_base_jit_constants(params);
+ 
+@@ -988,6 +996,7 @@ protected:
+ 
+         const bool is_kv_compressed = get_kv_compressed(params);
+         jit.make("IS_KV_COMPRESSED", is_kv_compressed ? 1 : 0);
++        jit.make("PA_KV_VEC_BLOCK", use_vector_block_update(params) ? 1 : 0);
+         if (is_kv_compressed) {
+             auto data_type = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;  // key tensor data size
+             auto scales_zp_size = get_element_size(data_type) * 2;                         // scale + zp
+@@ -1070,7 +1079,8 @@ protected:
+             if (is_prefill) {
+                 const auto blocks_number = rtp->paged_attention_aligned_seq_len / paged_attention_block_size;
+ 
+-                wgs.global = {blocks_number, heads_number, subgroup_size};
++                const size_t heads_dispatch = use_vector_block_update(params) ? heads_number * 2 : heads_number;
++                wgs.global = {blocks_number, heads_dispatch, subgroup_size};
+                 wgs.local = {1, 1, subgroup_size};
+             } else {
+                 const auto& key_input = params.input_layouts[0];

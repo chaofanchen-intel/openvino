@@ -1,0 +1,274 @@
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
+index bf69824bf9..9472ba4300 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "fc_horizontal_fusion.hpp"
+ 
++#include <algorithm>
++
+ #include "intel_gpu/op/fully_connected.hpp"
+ #include "intel_gpu/op/fully_connected_compressed.hpp"
+ 
+@@ -395,4 +397,98 @@ FullyConnectedHorizontalFusion::FullyConnectedHorizontalFusion(bool fuse_mlp_swi
+     this->register_matcher(m, callback);
+ }
+ 
++FullyConnectedUncompressedHorizontalFusion::FullyConnectedUncompressedHorizontalFusion() {
++    using namespace ov::pass::pattern;
++
++    constexpr size_t num_fcs_to_fuse = 3;
++
++    // FullyConnectedCompressed derives from FullyConnected; those are handled by FullyConnectedHorizontalFusion.
++    auto as_plain_fc = [](const std::shared_ptr<ov::Node>& node) -> std::shared_ptr<op::FullyConnected> {
++        if (ov::is_type<op::FullyConnectedCompressed>(node))
++            return nullptr;
++        return ov::as_type_ptr<op::FullyConnected>(node);
++    };
++
++    // The matched FC and all of its siblings reading the same activation (in graph order).
++    auto collect_siblings = [=](const std::shared_ptr<op::FullyConnected>& fc) {
++        std::vector<std::shared_ptr<op::FullyConnected>> fcs;
++        for (const auto& target : fc->input_value(0).get_target_inputs()) {
++            if (auto user = as_plain_fc(target.get_node()->shared_from_this()); user && target.get_index() == 0)
++                fcs.push_back(user);
++        }
++        return fcs;
++    };
++
++    auto is_target_pattern = [=](const Output<Node>& output) {
++        const auto fc = as_plain_fc(output.get_node_shared_ptr());
++        if (!fc || !fc->get_input_partial_shape(0).is_dynamic())
++            return false;
++        const auto fcs = collect_siblings(fc);
++        if (fcs.size() != num_fcs_to_fuse)
++            return false;
++        // The concatenated weights are folded at compile time, so they must be plain constants; no bias.
++        return std::all_of(fcs.begin(), fcs.end(), [](const std::shared_ptr<op::FullyConnected>& user) {
++            return ov::is_type<ov::op::v0::Constant>(user->get_input_node_shared_ptr(1)) &&
++                   ov::is_type<op::Placeholder>(user->get_input_node_shared_ptr(2));
++        });
++    };
++
++    auto target_fc = wrap_type<op::FullyConnected>(is_target_pattern);
++
++    ov::matcher_pass_callback callback = [=](Matcher& m) {
++        const auto matched = as_plain_fc(m.get_pattern_value_map().at(target_fc).get_node_shared_ptr());
++        if (!matched)
++            return false;
++        const auto fc_nodes = collect_siblings(matched);
++        if (fc_nodes.size() != num_fcs_to_fuse)
++            return false;
++
++        const bool transpose_b = fc_nodes[0]->get_transpose_b();
++        const size_t n_axis = transpose_b ? 0 : 1;
++        const size_t k_axis = transpose_b ? 1 : 0;
++        const auto weight_type = fc_nodes[0]->get_input_element_type(1);
++        const auto output_type = fc_nodes[0]->get_output_type();
++        if (fc_nodes[0]->get_input_shape(1).size() != 2)
++            return false;
++        const auto k_size = fc_nodes[0]->get_input_shape(1)[k_axis];
++
++        ov::OutputVector weights;
++        ov::NodeVector fc_nodes_vec;
++        std::vector<int64_t> n_sizes;
++        for (const auto& fc : fc_nodes) {
++            if (fc->get_input_element_type(1) != weight_type || fc->get_transpose_b() != transpose_b || fc->get_output_type() != output_type ||
++                fc->get_input_shape(1).size() != 2 || fc->get_input_shape(1)[k_axis] != k_size)
++                return false;
++            weights.push_back(fc->input_value(1));
++            fc_nodes_vec.push_back(fc);
++            n_sizes.push_back(static_cast<int64_t>(fc->get_input_shape(1)[n_axis]));
++        }
++
++        auto fused_weight = std::make_shared<ov::op::v0::Concat>(weights, n_axis);
++        fused_weight->set_friendly_name(fc_nodes[0]->get_input_node_shared_ptr(1)->get_friendly_name() + "_fused_weight");
++        ov::copy_runtime_info(fc_nodes_vec, fused_weight);
++
++        auto new_fc = std::make_shared<op::FullyConnected>(matched->input_value(0), fused_weight, std::make_shared<op::Placeholder>(), output_type, transpose_b);
++        new_fc->set_friendly_name(fc_nodes[0]->get_friendly_name() + "_fused_" + std::to_string(fc_nodes.size()) + "FCs");
++        ov::copy_runtime_info(fc_nodes_vec, new_fc);
++
++        auto axis_const = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {new_fc->get_output_partial_shape(0).size() - 1});
++        auto split_const = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{fc_nodes.size()}, n_sizes);
++        auto output_split = std::make_shared<ov::op::v1::VariadicSplit>(new_fc, axis_const, split_const);
++        output_split->set_friendly_name(fc_nodes[0]->get_friendly_name() + "_split");
++        ov::copy_runtime_info(fc_nodes_vec, output_split);
++
++        for (size_t i = 0; i < fc_nodes.size(); ++i) {
++            for (const auto& target : fc_nodes[i]->output(0).get_target_inputs())
++                target.replace_source_output(output_split->output(i));
++            fc_nodes[i]->clear_control_dependencies();
++        }
++        GPU_DEBUG_TRACE_DETAIL << "Created a new fused uncompressed FC " << new_fc->get_friendly_name() << std::endl;
++        return true;
++    };
++
++    auto m = std::make_shared<ov::pass::pattern::Matcher>(target_fc, "FullyConnectedUncompressedHorizontalFusion");
++    this->register_matcher(m, callback);
++}
++
+ }  // namespace ov::intel_gpu
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.hpp b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.hpp
+index 1f36b3a258..a84acdd3a4 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.hpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations/fc_horizontal_fusion.hpp
+@@ -14,4 +14,13 @@ public:
+     FullyConnectedHorizontalFusion(bool fuse_mlp_swiglu = false);
+ };
+ 
++// Same idea for uncompressed (f16/f32 weight) FCs, targeting the Q/K/V projections: three bias-free FCs that read one
++// activation become a single FC over concatenated weights followed by a VariadicSplit (lowered to in-place crops).
++// One GEMM with a 4x larger N runs closer to peak than three small ones and reads the activation once.
++class FullyConnectedUncompressedHorizontalFusion: public ov::pass::MatcherPass {
++public:
++    OPENVINO_MATCHER_PASS_RTTI("FullyConnectedUncompressedHorizontalFusion");
++    FullyConnectedUncompressedHorizontalFusion();
++};
++
+ }   // namespace ov::intel_gpu
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+index 53f683c6b5..4667579377 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+@@ -1629,6 +1629,9 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+                                !disable_fc_swiglu_fusion;
+         if (!disable_horizontal_fc_fusion) {
+             manager.register_pass<ov::intel_gpu::FullyConnectedHorizontalFusion>(fuse_mlp_swiglu);
++            if (device_info.supports_immad && config.get_use_onednn()) {
++                manager.register_pass<ov::intel_gpu::FullyConnectedUncompressedHorizontalFusion>();
++            }
+ 
+             if (config.get_enable_lora_operation()) {
+                 manager.register_pass<ov::intel_gpu::LoRASubgraphHorizontalFusion>();
+diff --git a/src/plugins/intel_gpu/tests/unit/transformations/horizontal_fc_fusion_test.cpp b/src/plugins/intel_gpu/tests/unit/transformations/horizontal_fc_fusion_test.cpp
+index 40df8bbe7c..b965d246b7 100644
+--- a/src/plugins/intel_gpu/tests/unit/transformations/horizontal_fc_fusion_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/transformations/horizontal_fc_fusion_test.cpp
+@@ -6,6 +6,7 @@
+ #include "common_test_utils/graph_comparator.hpp"
+ #include "common_test_utils/ov_test_utils.hpp"
+ 
++#include <algorithm>
+ #include <string>
+ #include <memory>
+ 
+@@ -25,6 +26,7 @@
+ #include <transformations/utils/utils.hpp>
+ #include "plugin/transformations/fc_horizontal_fusion.hpp"
+ #include "intel_gpu/op/placeholder.hpp"
++#include "intel_gpu/op/fully_connected.hpp"
+ #include "intel_gpu/op/fully_connected_compressed.hpp"
+ 
+ using namespace testing;
+@@ -528,6 +530,108 @@ TEST_F(TransformationTestsF, FullyConnectedHorizontalFusion_transpose_b_false) {
+     }
+ }
+ 
++
++namespace {
++
++// Build input[-1, 7, 1024] -> n_fcs FullyConnected (f16 weights, one per entry of `n_sizes`) -> Results and run the pass.
++// Returns the transformed model.
++std::shared_ptr<ov::Model> run_uncompressed_fusion(const std::vector<size_t>& n_sizes, bool constant_weights, bool with_bias) {
++    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 7, 1024});
++    ov::ParameterVector params{input};
++    ov::ResultVector results;
++    for (auto n : n_sizes) {
++        std::shared_ptr<ov::Node> weight;
++        if (constant_weights) {
++            weight = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{n, 1024});
++        } else {
++            auto p = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{n, 1024});
++            params.push_back(p);
++            weight = p;
++        }
++        std::shared_ptr<ov::Node> bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
++        if (with_bias)
++            bias = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{1, 1, n});
++        auto fc = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, weight, bias);
++        results.push_back(std::make_shared<ov::op::v0::Result>(fc));
++    }
++    auto model = std::make_shared<ov::Model>(results, params);
++    ov::pass::Manager manager;
++    manager.register_pass<FullyConnectedUncompressedHorizontalFusion>();
++    manager.run_passes(model);
++    return model;
++}
++
++size_t count_ops(const std::shared_ptr<ov::Model>& model, const ov::DiscreteTypeInfo& type) {
++    const auto ops = model->get_ops();
++    return std::count_if(ops.begin(), ops.end(), [&](const std::shared_ptr<ov::Node>& n) {
++        return n->get_type_info() == type;
++    });
++}
++
++}  // namespace
++
++TEST(FullyConnectedUncompressedHorizontalFusion, qkv_projections_are_fused) {
++    auto model = run_uncompressed_fusion({2048, 1024, 512}, true, false);
++    ASSERT_EQ(count_ops(model, ov::intel_gpu::op::FullyConnected::get_type_info_static()), 1u);
++    ASSERT_EQ(count_ops(model, ov::op::v1::VariadicSplit::get_type_info_static()), 1u);
++    const auto ops = model->get_ops();
++    for (const auto& node : ops) {
++        if (auto fc = ov::as_type_ptr<ov::intel_gpu::op::FullyConnected>(node)) {
++            // Concatenated along N, contraction dimension untouched, output [-1, 7, 2048 + 1024 + 512].
++            ASSERT_EQ(fc->get_input_shape(1), (ov::Shape{2048 + 1024 + 512, 1024}));
++            ASSERT_EQ(fc->get_output_partial_shape(0), (ov::PartialShape{-1, 7, 2048 + 1024 + 512}));
++        }
++        if (auto split = ov::as_type_ptr<ov::op::v1::VariadicSplit>(node)) {
++            std::vector<size_t> shapes;
++            for (const auto& out : split->outputs())
++                shapes.push_back(out.get_partial_shape()[2].get_length());
++            std::sort(shapes.begin(), shapes.end());
++            ASSERT_EQ(shapes, (std::vector<size_t>{512, 1024, 2048}));
++        }
++    }
++    // Every original Result still has the right width.
++    std::vector<size_t> widths;
++    for (const auto& r : model->get_results())
++        widths.push_back(r->get_input_partial_shape(0)[2].get_length());
++    std::sort(widths.begin(), widths.end());
++    ASSERT_EQ(widths, (std::vector<size_t>{512, 1024, 2048}));
++}
++
++TEST(FullyConnectedUncompressedHorizontalFusion, two_projections_are_not_fused) {
++    auto model = run_uncompressed_fusion({3072, 3072}, true, false);  // gate/up: a split on the innermost axis costs a copy
++    ASSERT_EQ(count_ops(model, ov::intel_gpu::op::FullyConnected::get_type_info_static()), 2u);
++    ASSERT_EQ(count_ops(model, ov::op::v1::VariadicSplit::get_type_info_static()), 0u);
++}
++
++TEST(FullyConnectedUncompressedHorizontalFusion, non_constant_weights_are_not_fused) {
++    auto model = run_uncompressed_fusion({2048, 1024, 1024}, false, false);
++    ASSERT_EQ(count_ops(model, ov::intel_gpu::op::FullyConnected::get_type_info_static()), 3u);
++    ASSERT_EQ(count_ops(model, ov::op::v1::VariadicSplit::get_type_info_static()), 0u);
++}
++
++TEST(FullyConnectedUncompressedHorizontalFusion, projections_with_bias_are_not_fused) {
++    auto model = run_uncompressed_fusion({2048, 1024, 1024}, true, true);
++    ASSERT_EQ(count_ops(model, ov::intel_gpu::op::FullyConnected::get_type_info_static()), 3u);
++    ASSERT_EQ(count_ops(model, ov::op::v1::VariadicSplit::get_type_info_static()), 0u);
++}
++
++TEST(FullyConnectedUncompressedHorizontalFusion, compressed_fcs_are_left_to_the_compressed_pass) {
++    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 7, 1024});
++    ov::ResultVector results;
++    for (size_t n : {2048, 1024, 1024}) {
++        auto weight = std::make_shared<ov::op::v0::Constant>(ov::element::u8, ov::Shape{n, 1024});
++        auto bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
++        auto scale = std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{n, 1});
++        auto fc = std::make_shared<ov::intel_gpu::op::FullyConnectedCompressed>(input, weight, bias, scale);
++        results.push_back(std::make_shared<ov::op::v0::Result>(fc));
++    }
++    auto model = std::make_shared<ov::Model>(results, ov::ParameterVector{input});
++    ov::pass::Manager manager;
++    manager.register_pass<FullyConnectedUncompressedHorizontalFusion>();
++    manager.run_passes(model);
++    ASSERT_EQ(count_ops(model, ov::op::v1::VariadicSplit::get_type_info_static()), 0u);
++}
++
+ }  // namespace intel_gpu
+ }  // namespace test
+ }  // namespace ov
+\ No newline at end of file
