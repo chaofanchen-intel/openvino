@@ -1,0 +1,602 @@
+From 36d9e7bfbf144747209d9fb3341c94e306a7f9ca Mon Sep 17 00:00:00 2001
+From: qwen35 <qwen35@local>
+Date: Tue, 27 Oct 2026 03:09:07 +0800
+Subject: [PATCH 4/4] [GPU] Fold RMSNorm into DynamicQuantize
+
+The weight-compressed FullyConnected path quantises its activation with DynamicQuantize
+(symmetric i8, group 128). For 47 of the 48 pre-GEMM RMSNorms of Qwen3.5-2B the
+RMSNorm output is consumed only by that DynamicQuantize, so the normalised f16 tensor is
+written and read back for nothing.
+
+* DynamicQuantize gets `fused_rms` / `rms_eps` attributes (hash, ==, save/load).
+* prepare_primitive_fusing: new fuse_rms_into_dynamic_quantize pass (symmetric i8, group
+  128, identity order, power-of-two row <= 32 x 128 elements, gamma covers the row, f16,
+  affine RMS with a single consumer; also supports the precomputed-reduction (INT8
+  weight-only) variant).
+* dynamic_quantize_gpu_opt.cl: FUSE_RMS path = reduction, normalisation and gamma in
+  registers, f16 rounding at the original boundary, then quantisation. The ref and
+  kv-cache kernels refuse fused_rms.
+* A folded node cannot be skipped to the f16 pass-through at batch 1, so decode quantises
+  at those sites (INT8 TPOT +0.3 ms).
+
+Unit test: fused_rms_matches_separate_rms_and_dq (bit-exact vs the separate kernels).
+---
+ .../intel_gpu/primitives/dynamic_quantize.hpp |  15 +++
+ .../intel_gpu/src/graph/dynamic_quantize.cpp  |   7 ++
+ .../prepare_primitive_fusing.cpp              | 119 ++++++++++++++++++
+ .../src/graph/impls/ocl/dynamic_quantize.cpp  |   7 ++
+ .../src/graph/include/pass_manager.h          |   1 +
+ .../intel_gpu/src/graph/primitive_inst.cpp    |   3 +-
+ .../cl_kernels/dynamic_quantize_gpu_opt.cl    |  61 ++++++++-
+ .../dynamic_quantize_kernel_opt.cpp           |  41 +++++-
+ .../dynamic_quantize_kernel_opt_kv_cache.cpp  |   5 +
+ .../dynamic_quantize_kernel_ref.cpp           |   5 +
+ .../dynamic_quantize_kernel_ref.h             |   4 +
+ .../test_cases/dynamic_quantize_gpu_test.cpp  |  71 +++++++++++
+ 12 files changed, 336 insertions(+), 3 deletions(-)
+
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/primitives/dynamic_quantize.hpp b/src/plugins/intel_gpu/include/intel_gpu/primitives/dynamic_quantize.hpp
+index 4a2d6a2..59de29e 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/primitives/dynamic_quantize.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/primitives/dynamic_quantize.hpp
+@@ -48,9 +48,18 @@ struct dynamic_quantize : public primitive_base<dynamic_quantize> {
+     Attributes attrs;
+     size_t input_size;
+     size_t innermost_size = 0;
++    /// @brief RMSNorm folded into this primitive (see prepare_primitive_fusing::fuse_rms_into_dynamic_quantize).
++    /// When set, input[0] is the *un-normalized* activation and input[1] is the RMSNorm gamma; the
++    /// kernel normalizes before quantizing, which removes the f16 intermediate that the standalone
++    /// rms primitive used to write and this primitive used to read back.
++    bool fused_rms = false;
++    /// @brief Epsilon of the folded RMSNorm. Only meaningful when fused_rms is set.
++    float rms_eps = 0.f;
+ 
+     size_t hash() const override {
+         size_t seed = primitive::hash();
++        seed = hash_combine(seed, fused_rms);
++        seed = hash_combine(seed, rms_eps);
+         seed = hash_range(seed, attrs.scales_zp_output_order.begin(), attrs.scales_zp_output_order.end());
+         seed = hash_range(seed, attrs.group_sizes.begin(), attrs.group_sizes.end());
+         seed = hash_combine(seed, attrs.quantization_type);
+@@ -81,6 +90,8 @@ struct dynamic_quantize : public primitive_base<dynamic_quantize> {
+                attrs.quantization_type == rhs_casted.attrs.quantization_type &&
+                attrs.precomputed_reduction == rhs_casted.attrs.precomputed_reduction &&
+                attrs.precomputed_reduction_dt == rhs_casted.attrs.precomputed_reduction_dt &&
++               fused_rms == rhs_casted.fused_rms &&
++               rms_eps == rhs_casted.rms_eps &&
+                input_size == rhs_casted.input_size &&
+                innermost_size == rhs_casted.innermost_size;
+     }
+@@ -97,6 +108,8 @@ struct dynamic_quantize : public primitive_base<dynamic_quantize> {
+         ob << attrs.scales_zp_output_order;
+         ob << attrs.group_sizes;
+         ob << attrs.precomputed_reduction;
++        ob << fused_rms;
++        ob << rms_eps;
+         ob << input_size;
+         ob << innermost_size;
+     }
+@@ -113,6 +126,8 @@ struct dynamic_quantize : public primitive_base<dynamic_quantize> {
+         ib >> attrs.scales_zp_output_order;
+         ib >> attrs.group_sizes;
+         ib >> attrs.precomputed_reduction;
++        ib >> fused_rms;
++        ib >> rms_eps;
+         ib >> input_size;
+         ib >> innermost_size;
+     }
+diff --git a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+index 4fd8a86..df14c08 100644
+--- a/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
++++ b/src/plugins/intel_gpu/src/graph/dynamic_quantize.cpp
+@@ -24,6 +24,13 @@ static bool should_skip_execution(const dynamic_quantize_node& node, const layou
+         || !act_layout.is_static())
+         return false;
+ 
++    // A node with a folded RMSNorm has no pass-through form: skipping would alias the primitive's
++    // output to its input, which here is the *un-normalized* activation, so the normalization
++    // would be lost. Such a node always executes and always emits quantized data, including at
++    // batch 1. See prepare_primitive_fusing::fuse_rms_into_dynamic_quantize.
++    if (node.get_primitive()->fused_rms)
++        return false;
++
+     // Do not skip dynamic quantization if any user node is not fully connected.(such as SDPA)
+     for (const auto& user : node.get_users()) {
+         if (!user->is_type<fully_connected>())
+diff --git a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+index cbbd34c..e2157f9 100644
+--- a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
++++ b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+@@ -8,6 +8,7 @@
+ #include "pooling_inst.h"
+ #include "proposal_inst.h"
+ #include "roi_pooling_inst.h"
++#include "dynamic_quantize_inst.h"
+ #include "quantize_inst.h"
+ #include "activation_inst.h"
+ #include "batch_to_space_inst.h"
+@@ -89,6 +90,124 @@ void prepare_primitive_fusing::run(program& p) {
+     fuse_simple_primitives(p);
+     fuse_constant_transposes(p);
+     optimize_fused_ops(p);
++    fuse_rms_into_dynamic_quantize(p);
++}
++
++// Fold `rms -> dynamic_quantize` into a single dynamic_quantize that normalizes internally.
++//
++// Why. On a bandwidth-limited iGPU both primitives run at the DRAM ceiling, so their cost is
++// simply the bytes they move. The pair currently moves, per [T, H] f16 activation:
++//     rms:  read T*H*2 (x)          + write T*H*2 (normalized f16)
++//     dq:   read T*H*2 (normalized) + write T*H   (s8) + scales
++// The middle f16 tensor is written once and read straight back, purely to hand the value from
++// one kernel to the next. Folding rms into dq removes both of those passes -- 2*T*H*2 bytes per
++// site -- leaving read x / write s8. For Qwen3.5-2B at a 1k prefill this pattern occurs on the
++// input_layernorm and post_attention_layernorm of all 24 decoder layers; 47 of those 48 sites
++// match (layer 0's input_layernorm keeps a second consumer of the normalized tensor, so its rms
++// has to stay), which at 1002x2048 f16 removes ~385 MB of DRAM traffic from the prefill.
++//
++// Bit-exactness. The fused kernel reproduces rms_gpu_bfyx_opt's reduction *structure* exactly
++// (see dynamic_quantize_gpu_opt.cl, MODE_LARGE_GS / FUSE_RMS), and rounds the normalized value
++// to f16 before quantizing, which is what the standalone dynamic_quantize used to read. The
++// quantized output is therefore bit-identical to the un-fused graph, not merely close.
++//
++// Decode. dynamic_quantize normally turns itself into an f16 pass-through for small batches
++// (should_skip_execution), which the decode phase relies on. A fused node cannot do that: its
++// input is the un-normalized activation, so aliasing output to input would silently drop the
++// normalization. Serving both forms from one node would need the output data type to flip
++// i8 <-> f16 at runtime, which a single shape-agnostic compiled kernel cannot do, so fused nodes
++// simply never skip -- see the fused_rms guards in dynamic_quantize_inst::should_skip_execution
++// and primitive_inst::update_shape. The cost is that the folded sites keep quantizing at batch 1;
++// that is a fraction of a percent of TPOT, but it does perturb the decode numerics of those
++// layers relative to the un-fused graph (prefill stays bit-exact).
++void prepare_primitive_fusing::fuse_rms_into_dynamic_quantize(program& p) {
++    auto itr = p.get_processing_order().begin();
++    while (itr != p.get_processing_order().end()) {
++        auto node = *itr++;
++        if (!node->is_type<dynamic_quantize>() || node->is_output())
++            continue;
++
++        auto& dq_node = node->as<dynamic_quantize>();
++        auto dq_prim = std::const_pointer_cast<dynamic_quantize>(dq_node.get_primitive());
++        if (dq_prim->fused_rms || dq_node.has_fused_primitives() || dq_node.get_dependencies().size() != 1)
++            continue;
++
++        auto& rms_node = dq_node.get_dependency(0);
++        if (!rms_node.is_type<rms>() || rms_node.is_output() || rms_node.get_users().size() != 1)
++            continue;
++
++        auto rms_prim = rms_node.as<rms>().get_primitive();
++        // Only the affine form is folded: the kernel always applies gamma, and a gamma-less rms
++        // would need a second kernel variant for no additional traffic saving.
++        if (!rms_prim->elementwise_affine || rms_node.get_dependencies().size() != 2)
++            continue;
++
++        // The fused kernel reads x and writes s8 in one pass, so both must be plain f16 buffers.
++        if (rms_node.get_input_layouts()[0].data_type != data_types::f16 ||
++            rms_node.get_output_layout().data_type != data_types::f16 ||
++            dq_node.get_input_layouts()[0].data_type != data_types::f16)
++            continue;
++
++        // Everything below mirrors DynamicQuantizeKernelOpt's FUSE_RMS preconditions. It has to:
++        // the folded form is implemented by that one kernel only, and the ref/kv-cache kernels
++        // refuse it rather than silently quantize an un-normalized activation. So a node fused
++        // here that the kernel then rejects leaves the selector with no candidate at all and the
++        // model fails to compile. Only properties that cannot change after this pass are used --
++        // primitive attributes and the (static) reduction extent -- so the mirror stays valid.
++        using QuantizationType = ov::op::internal::DynamicQuantize::QuantizationType;
++        const auto& attrs = dq_prim->attrs;
++        if (attrs.quantization_type != QuantizationType::Symmetric || attrs.quantization_dt != data_types::i8)
++            continue;
++
++        // One 128-element quantization group per sub-group (SIMD 16 x VEC_SIZE 8) along the last
++        // axis, which is the only shape the fused branch of the kernel emits. Note this excludes
++        // the per-token mode the plugin picks by default on systolic hardware.
++        if (attrs.group_sizes.empty() || attrs.group_sizes.back() != 128)
++            continue;
++        if (std::any_of(attrs.group_sizes.begin(), std::prev(attrs.group_sizes.end()), [](uint64_t g) { return g != 1; }))
++            continue;
++        if (!attrs.scales_zp_output_order.empty()) {
++            bool identity = true;
++            for (size_t i = 0; i < attrs.scales_zp_output_order.size(); i++)
++                identity &= attrs.scales_zp_output_order[i] == i;
++            if (!identity)
++                continue;
++        }
++
++        // The RMS reduction spans the whole row inside a single work-group, so the row length must
++        // be known now, be a whole number of 128-element groups, and fit the kernel's 32-sub-group
++        // work-group cap.
++        const auto& x_pshape = rms_node.get_input_layouts()[0].get_partial_shape();
++        if (x_pshape.rank().is_dynamic() || x_pshape.size() == 0 || x_pshape[x_pshape.size() - 1].is_dynamic())
++            continue;
++        const auto row_size = static_cast<size_t>(x_pshape[x_pshape.size() - 1].get_length());
++        if (row_size % 128 != 0 || row_size / 128 > 32 || ((row_size / 128) & (row_size / 128 - 1)) != 0)
++            continue;
++
++        auto& x_node = rms_node.get_dependency(0);
++        auto& gamma_node = rms_node.get_dependency(1);
++
++        // gamma has to cover the reduction axis exactly; the kernel block-reads it as one row.
++        const auto gamma_layout = gamma_node.get_output_layout();
++        if (gamma_layout.is_dynamic() || gamma_layout.count() != row_size ||
++            gamma_layout.data_type != data_types::f16)
++            continue;
++
++        dq_prim->fused_rms = true;
++        dq_prim->rms_eps = rms_prim->epsilon;
++        dq_prim->input = { input_info(x_node.id()), input_info(gamma_node.id()) };
++
++        p.remove_connection(rms_node, dq_node);
++        p.add_connection(x_node, dq_node);
++        p.add_connection(gamma_node, dq_node);
++        if (p.remove_if_dangling(rms_node))
++            p.add_optimized_primitive_info(rms_prim->id, {dq_prim->id});
++
++        dq_node.recalc_output_layouts(false);
++
++        GPU_DEBUG_TRACE << "[fuse_rms_into_dynamic_quantize] folded " << rms_prim->id << " into " << dq_prim->id
++                        << std::endl;
++    }
+ }
+ 
+ static std::optional<size_t> find_eltwise_const_dep_idx(const eltwise_node& node) {
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl/dynamic_quantize.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl/dynamic_quantize.cpp
+index 6285d51..8c325e9 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl/dynamic_quantize.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl/dynamic_quantize.cpp
+@@ -54,6 +54,13 @@ struct dynamic_quantize_impl : typed_primitive_impl_ocl<dynamic_quantize> {
+         params.use_asymmetric_quantization = desc->attrs.quantization_type == ov::op::internal::DynamicQuantize::QuantizationType::Asymmetric;
+         params.combine_scales_and_zp = desc->attrs.output_storage_type != ov::op::internal::DynamicQuantize::OutputStorageType::Planar;
+         params.generate_precomputed_reduction = desc->attrs.precomputed_reduction;
++        params.fused_rms = desc->fused_rms;
++        params.rms_eps = desc->rms_eps;
++        if (desc->fused_rms) {
++            OPENVINO_ASSERT(impl_param.input_layouts.size() == 2,
++                            "[GPU] dynamic_quantize with a folded RMSNorm must have exactly 2 inputs: ", impl_param.desc->id);
++            params.inputs.push_back(convert_data_tensor(impl_param.get_input_layout(1)));
++        }
+ 
+         validate_f4e2m1_packed_output(impl_param.get_output_layout(0), "dynamic_quantize");
+ 
+diff --git a/src/plugins/intel_gpu/src/graph/include/pass_manager.h b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
+index c86259e..d1e0428 100644
+--- a/src/plugins/intel_gpu/src/graph/include/pass_manager.h
++++ b/src/plugins/intel_gpu/src/graph/include/pass_manager.h
+@@ -161,6 +161,7 @@ private:
+     void fuse_constant_transposes(program& p);
+     void optimize_fused_ops(program& p);
+     void remove_redundant_reshape(program& p);
++    void fuse_rms_into_dynamic_quantize(program& p);
+ };
+ 
+ class pre_replace_deconv : public base_pass {
+diff --git a/src/plugins/intel_gpu/src/graph/primitive_inst.cpp b/src/plugins/intel_gpu/src/graph/primitive_inst.cpp
+index 8ffdc86..cb0160e 100644
+--- a/src/plugins/intel_gpu/src/graph/primitive_inst.cpp
++++ b/src/plugins/intel_gpu/src/graph/primitive_inst.cpp
+@@ -560,7 +560,8 @@ void primitive_inst::update_shape() {
+         auto &layout = _impl_params->get_output_layout(0);
+         OPENVINO_ASSERT(one_of(layout.data_type, {data_types::f16, data_types::i8, data_types::u8, data_types::f4e2m1, data_types::f8e4m3, data_types::f8e5m2}),
+             "[GPU] Unsupported data type of dynamic_quantize: ", layout.data_type);
+-        if (layout.data_type == data_types::f16)
++        const bool fused_rms = get_node().as<dynamic_quantize>().get_primitive()->fused_rms;
++        if (layout.data_type == data_types::f16 && !fused_rms)
+             set_can_be_optimized(true);
+         else
+             set_can_be_optimized(false);
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/dynamic_quantize_gpu_opt.cl b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/dynamic_quantize_gpu_opt.cl
+index 244d4d6..b0a8c01 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/dynamic_quantize_gpu_opt.cl
++++ b/src/plugins/intel_gpu/src/kernel_selector/cl_kernels/dynamic_quantize_gpu_opt.cl
+@@ -11,6 +11,11 @@
+ #include "include/f8_utils.cl"
+ #endif
+ 
++#if FUSE_RMS
++#include "include/batch_headers/sub_group_block_read.cl"
++#include "include/batch_headers/sub_group_block_write.cl"
++#endif
++
+ #if F4E2M1_OUTPUT
+ #include "include/f4_utils.cl"
+ #endif
+@@ -159,10 +164,24 @@ KERNEL(dynamic_quantize_gpu_opt)(
+ #error "UNIMPLMENTED: asymmetric quantization with precomputed_reduction generation"
+ #endif
+ 
++#if FUSE_RMS
++// The folded RMSNorm path only covers the plain symmetric-i8 configuration; everything else is
++// rejected by DynamicQuantizeKernelOpt::Validate, so reaching here with another one is a bug.
++#if ASYMMETRIC_QUANTIZATION != 0 || IS_F8 != 0 || IS_MXFP != 0
++#error "UNIMPLMENTED: FUSE_RMS is only supported for symmetric int8 quantization"
++#endif
++#if QUANTIZE_GROUP_SIZE != (SIMD * VEC_SIZE)
++#error "FUSE_RMS requires exactly one quantization group per sub-group"
++#endif
++#endif
++
+ REQD_SUB_GROUP_SIZE(SIMD)
+ KERNEL(dynamic_quantize_gpu_opt)(
+     OPTIONAL_SHAPE_INFO_ARG
+     const __global INPUT0_TYPE* input,
++#if FUSE_RMS
++    const __global INPUT1_TYPE* gamma,
++#endif
+     __global OUTPUT_TYPE* output,
+     __global OUTPUT1_TYPE* output_scale
+ #if ASYMMETRIC_QUANTIZATION
+@@ -196,8 +215,11 @@ KERNEL(dynamic_quantize_gpu_opt)(
+ #endif
+     const uint offset = b_offset + VEC_SIZE * sglid;
+ 
+-#if BLOCKS_PER_GROUP > 1
++#if FUSE_RMS || BLOCKS_PER_GROUP > 1
+     const uint local_id = get_local_id(1);
++#endif
++
++#if BLOCKS_PER_GROUP > 1
+     __local half local_mem_max[BLOCK_NUM];
+     __local half local_mem_min[BLOCK_NUM];
+     FOR_PRECOMPUTED_REDUCTION(__local int local_mem_reduction[BLOCK_NUM]);
+@@ -210,12 +232,46 @@ KERNEL(dynamic_quantize_gpu_opt)(
+     half max_value = 0.0h;
+     half min_value = 0.0h;
+     
++#if FUSE_RMS
++    // Folded RMSNorm of the whole row (one work-group = one row, one sub-group = one 128-element block). The operation order
++    // is the one of rms_gpu_bfyx_opt: strided sub-group block reads, per-work-item sum of squares in f32, sub-group reduce,
++    // SLM tree over the sub-group partials, rsqrt, then f32 (rms * x * gamma) rounded to f16. The normalized f16 value is what
++    // the separate rms primitive used to write and this kernel used to read, so the quantized result is bit-identical.
++    __local float rms_slm[RMS_SUB_GROUP_NUM];
++    const half8 x_raw = BLOCK_READN(half, 8, input, b_offset + local_id * block_size);
++    float rms_ss = 0.0f;
++    unroll_for (int j = 0; j < VEC_SIZE; j++) {
++        const float t = convert_float(x_raw[j]);
++        rms_ss += native_powr(t, 2);
++    }
++    rms_ss = sub_group_reduce_add(rms_ss);
++    if (sglid == 0)
++        rms_slm[local_id] = rms_ss;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    const uint rms_lin = local_id * SIMD + sglid;
++    for (uint rms_off = RMS_SUB_GROUP_NUM / 2; rms_off > 0; rms_off /= 2) {
++        if (rms_lin < rms_off)
++            rms_slm[rms_lin] += rms_slm[rms_lin + rms_off];
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++    if (rms_lin == 0) {
++        const float mean_sq = rms_slm[0] / RMS_DATA_SIZE;
++        rms_slm[0] = native_powr(sqrt(mean_sq + RMS_EPSILON), -1);
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    const float rms_inv = rms_slm[0];
++    const half8 gamma_raw = BLOCK_READN(half, 8, gamma, local_id * block_size);
++    unroll_for (int j = 0; j < VEC_SIZE; j++) {
++        val[j] = convert_half(rms_inv * convert_float(x_raw[j]) * convert_float(gamma_raw[j]));
++    }
++#else
+     if (is_valid_block) {
+         val = AS_INPUT_TYPE_N(VLOAD_N(0, input + input_offset + (blockid * block_size)));
+     } else {
+         // Initialize with zero for skipped blocks  
+         val = (MAKE_VECTOR_TYPE(INPUT0_TYPE, VEC_SIZE))(0);
+     }
++#endif
+ 
+ #if ASYMMETRIC_QUANTIZATION
+     if (is_valid_block) {
+@@ -297,6 +353,9 @@ KERNEL(dynamic_quantize_gpu_opt)(
+         val *= scale;
+         val += zp;
+         VSTORE_N(CAT(CONVERT_UCHAR_N, _rte)(val), 0, output + output_offset + (blockid * block_size));
++#elif FUSE_RMS // i8 symmetric, elements held in the strided sub-group block layout
++        val *= scale;
++        BLOCK_WRITEN(char, 8, output, output_offset - VEC_SIZE * sglid, CAT(CONVERT_CHAR_N, _rte)(val));
+ #else // i8 symmetric
+         val *= scale;
+         VSTORE_N(CAT(CONVERT_CHAR_N, _rte)(val), 0, output + output_offset + (blockid * block_size));
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt.cpp
+index a8dcd97..753ca94 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt.cpp
+@@ -121,6 +121,15 @@ JitConstants DynamicQuantizeKernelOpt::GetJitConstants(const dynamic_quantize_pa
+     size_t block_num = (total_block_num > 32) ? 32 : total_block_num;
+     jit.AddConstant(MakeJitConstant("BLOCK_NUM", block_num));
+ 
++    jit.AddConstant(MakeJitConstant("FUSE_RMS", params.fused_rms));
++    if (params.fused_rms) {
++        // Reproduce rms_gpu_bfyx_opt's reduction structure so the normalized value is bit-exact
++        // (see the FUSE_RMS block in dynamic_quantize_gpu_opt.cl for why each of these matters).
++        jit.AddConstant(MakeJitConstant("RMS_EPSILON", params.rms_eps));
++        jit.AddConstant(MakeJitConstant("RMS_DATA_SIZE", bf_size.second));
++        jit.AddConstant(MakeJitConstant("RMS_SUB_GROUP_NUM", total_block_num));
++    }
++
+     if (mode == DynQuanMode::PER_TOKEN)  {
+         size_t aligned_block_num = (total_block_num > 32) ? Align(total_block_num, 32) : total_block_num;
+         jit.AddConstant(MakeJitConstant("ALIGNED_BLOCK_NUM", aligned_block_num));
+@@ -207,7 +216,7 @@ KernelsData DynamicQuantizeKernelOpt::GetKernelsData(const Params& params) const
+                      EXE_MODE_DEFAULT,
+                      false,
+                      false,
+-                     1,
++                     static_cast<int>(prim_params.inputs.size()),
+                      GetFusedPrimitiveInputsCount(params),
+                      static_cast<int>(prim_params.outputs.size()),
+                      prim_params.is_shape_agnostic);
+@@ -261,6 +270,36 @@ bool DynamicQuantizeKernelOpt::Validate(const Params& params) const {
+     if (dq_params.append_axis != -1)
+         DO_NOT_USE_THIS_KERNEL(params.layerID);
+ 
++    if (dq_params.fused_rms) {
++        // The folded RMSNorm reduces over the whole row, so the row must live inside one
++        // work-group and be laid out exactly as rms_gpu_bfyx_opt lays it out: MODE_LARGE_GS with
++        // one 128-element quantization group per sub-group and 8 elements per work-item.
++        if (dq_params.inputs.size() != 2)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        if (get_dynamic_quantize_mode(dq_params) != DynQuanMode::LARGE_GS)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        if (dq_params.use_asymmetric_quantization)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        if (dq_params.outputs[0].GetDType() != Datatype::INT8)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++
++        auto vec_size = get_match_vector_size(dq_params);
++        auto bf = get_input_bf_size(dq_params);
++        size_t total_block_num = bf.second / (simd * vec_size);
++        if (vec_size != 8 || dq_params.group_sizes.back() != simd * vec_size)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        // BLOCK_NUM caps the work-group at 32 sub-groups; beyond that a row spans several
++        // work-groups and the RMS reduction would need cross-work-group synchronization.
++        if (total_block_num > 32)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        // The SLM tree reduction over the sub-group partials halves the active range each step (as rms_gpu_bfyx_opt does).
++        if (total_block_num == 0 || (total_block_num & (total_block_num - 1)) != 0)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++        // gamma must cover the reduction axis exactly.
++        if (dq_params.inputs[1].LogicalSize() != bf.second)
++            DO_NOT_USE_THIS_KERNEL(params.layerID);
++    }
++
+     for (size_t i = 0; i < dq_params.group_sizes.size() - 1; i++) {
+         if (dq_params.group_sizes[i] != 1)
+             DO_NOT_USE_THIS_KERNEL(params.layerID);
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt_kv_cache.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt_kv_cache.cpp
+index c0a47c2..bd5889f 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt_kv_cache.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_opt_kv_cache.cpp
+@@ -269,6 +269,11 @@ bool DynamicQuantizeKernelKVCache::Validate(const Params& params) const {
+     if (dq_params.generate_precomputed_reduction)
+         DO_NOT_USE_THIS_KERNEL(params.layerID);
+ 
++    // A folded RMSNorm is only implemented by DynamicQuantizeKernelOpt. Falling back to this
++    // kernel would quantize the un-normalized activation, so refuse instead.
++    if (dq_params.fused_rms)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++
+     if (non_compressed_dims_number == group_sizes.size())
+         DO_NOT_USE_THIS_KERNEL(params.layerID);
+ 
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.cpp
+index f59bb1c..93a887b 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.cpp
+@@ -169,6 +169,11 @@ bool DynamicQuantizeKernelRef::Validate(const Params& params) const {
+         DO_NOT_USE_THIS_KERNEL(params.layerID);
+     }
+ 
++    // A folded RMSNorm is only implemented by DynamicQuantizeKernelOpt. Falling back to this
++    // kernel would quantize the un-normalized activation, so refuse instead.
++    if (dq_params.fused_rms)
++        DO_NOT_USE_THIS_KERNEL(params.layerID);
++
+     return true;
+ }
+ }  // namespace kernel_selector
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.h b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.h
+index b5f6c94..63d25d1 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.h
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/dynamic_quantize/dynamic_quantize_kernel_ref.h
+@@ -22,6 +22,10 @@ struct dynamic_quantize_params : public base_params {
+     bool combine_scales_and_zp = false;
+     bool generate_precomputed_reduction = false;
+     bool is_int4_compressed = false;
++    // RMSNorm folded into this primitive: inputs[0] is the un-normalized activation and
++    // inputs[1] is gamma. Only DynamicQuantizeKernelOpt implements it.
++    bool fused_rms = false;
++    float rms_eps = 0.f;
+ };
+ 
+ class DynamicQuantizeKernelRef : public KernelBaseOpenCL {
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/dynamic_quantize_gpu_test.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/dynamic_quantize_gpu_test.cpp
+index 5c0c23e..8de6429 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/dynamic_quantize_gpu_test.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/dynamic_quantize_gpu_test.cpp
+@@ -14,9 +14,12 @@
+ #include "intel_gpu/primitives/dynamic_quantize.hpp"
+ #include <intel_gpu/primitives/quantize.hpp>
+ #include <intel_gpu/primitives/data.hpp>
++#include <intel_gpu/primitives/reorder.hpp>
++#include <intel_gpu/primitives/rms.hpp>
+ 
+ #include "intel_gpu/runtime/compilation_context.hpp"
+ #include "fully_connected_inst.h"
++#include "dynamic_quantize_inst.h"
+ 
+ #include <cmath>
+ 
+@@ -562,3 +565,71 @@ TEST_F(dynamic_quantization_gpu_tests, dynamic_quantize_opt_gs16) {
+                                 data_types::i8, data_types::f16, data_types::dynamic, OutputStorageType::Planar,
+                                 "dynamic_quantize_gpu_opt");
+ }
++
++// prepare_primitive_fusing::fuse_rms_into_dynamic_quantize folds `rms -> dynamic_quantize` into one primitive. The folded
++// kernel reproduces the rms kernel's arithmetic and quantizes the f16-rounded result, so quantized data, scales and the
++// precomputed reductions must be identical to the separate pair. A second consumer on the rms output keeps the pair
++// unfused and serves as the reference.
++TEST_F(dynamic_quantization_gpu_tests, fused_rms_matches_separate_rms_and_dq) {
++    auto& engine = get_test_engine();
++    if (!engine.get_device_info().supports_non_uniform_work_group)
++        GTEST_SKIP();
++
++    tests::random_generator rg(GET_SUITE_NAME);
++    const ov::Shape x_shape{1, 37, 2048};
++    auto to_f16 = [](const std::vector<float>& v) { return std::vector<ov::float16>(v.begin(), v.end()); };
++    auto x_mem = engine.allocate_memory({x_shape, data_types::f16, format::bfyx});
++    auto gamma_mem = engine.allocate_memory({ov::Shape{1, 2048}, data_types::f16, format::bfyx});
++    set_values(x_mem, to_f16(rg.generate_random_1d<float>(ov::shape_size(x_shape), -8.0f, 8.0f)));
++    set_values(gamma_mem, to_f16(rg.generate_random_1d<float>(2048, 0.1f, 2.0f)));
++
++    dynamic_quantize::Attributes dq_config;
++    dq_config.quantization_type = QuantizationType::Symmetric;
++    dq_config.quantization_dt = data_types::i8;
++    dq_config.scale_dt = data_types::f16;
++    dq_config.zp_dt = data_types::i8;
++    dq_config.group_sizes = {1, 1, 128};
++    dq_config.scales_zp_output_order = {0, 1, 2};
++    dq_config.output_storage_type = OutputStorageType::Planar;
++    dq_config.precomputed_reduction = true;
++    dq_config.precomputed_reduction_dt = data_types::i32;
++
++    auto run = [&](bool second_rms_consumer) {
++        topology topology(
++            input_layout("input", x_mem->get_layout()),
++            data("gamma", gamma_mem),
++            rms("rms", input_info("input"), input_info("gamma"), 1e-6f),
++            dynamic_quantize("dyn_quan_prim", input_info("rms"), dq_config),
++            reorder("out_data", input_info("dyn_quan_prim", 0), layout{x_shape, data_types::f16, format::bfyx}),
++            reorder("out_scale", input_info("dyn_quan_prim", 1), layout{ov::PartialShape::dynamic(3), data_types::f16, format::bfyx}),
++            reorder("out_sum", input_info("dyn_quan_prim", 2), layout{ov::PartialShape::dynamic(3), data_types::f16, format::bfyx}));
++        if (second_rms_consumer)
++            topology.add(reorder("rms_copy", input_info("rms"), layout{x_shape, data_types::f32, format::bfyx}));
++
++        auto config = get_test_default_config(engine);
++        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++        config.set_property(ov::intel_gpu::optimize_data(true));
++        network network(engine, topology, config);
++        network.set_input_data("input", x_mem);
++        auto outputs = network.execute();
++
++        // The pair is folded exactly when rms has no other consumer.
++        EXPECT_EQ(network.get_program()->get_node("dyn_quan_prim").as<dynamic_quantize>().get_primitive()->fused_rms, !second_rms_consumer);
++
++        std::map<std::string, std::vector<ov::float16>> result;
++        for (const std::string id : {"out_data", "out_scale", "out_sum"}) {
++            auto mem = engine.reinterpret_buffer(*outputs.at(id).get_memory(), outputs.at(id).get_layout());
++            cldnn::mem_lock<ov::float16, mem_lock_type::read> ptr(mem, get_test_stream());
++            result[id].assign(ptr.begin(), ptr.end());
++        }
++        return result;
++    };
++
++    auto folded = run(false);
++    auto separate = run(true);
++    for (const auto& kv : separate) {
++        ASSERT_EQ(kv.second.size(), folded.at(kv.first).size()) << kv.first;
++        for (size_t i = 0; i < kv.second.size(); i++)
++            ASSERT_EQ(static_cast<float>(kv.second[i]), static_cast<float>(folded.at(kv.first)[i])) << kv.first << "[" << i << "]";
++    }
++}
+-- 
+2.43.0
+

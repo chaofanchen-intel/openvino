@@ -1,0 +1,42 @@
+diff --git a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_ref.cpp b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_ref.cpp
+index 2cf85c8f716018fc79ac9eee34e4768f50d52c9a..95146bd5e1af31d5e76ba2311810803ac9b1a3dc 100644
+--- a/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_ref.cpp
++++ b/src/plugins/intel_gpu/src/kernel_selector/kernels/permute/permute_kernel_ref.cpp
+@@ -146,6 +146,37 @@ CommonDispatchData PermuteKernelRef::SetDefault(const permute_params& params) co
+                                                                         {Tensor::DataChannelName::FEATURE, Tensor::DataChannelName::BATCH}};
+         dispatchData.gws = {in.X().v, in.Y().v * in.Z().v * in.W().v * in.U().v  * in.V().v , in.Feature().v * in.Batch().v};
+         dispatchData.lws = GetOptimalLocalWorkGroupSizes(dispatchData.gws, params.engineInfo, in_layout, out_layout, dims_by_gws);
++
++        // In this (non-F_FIRST) branch gws[2] is the F*B axis, which is the
++        // inner-most axis of the OUT_IDX math (output writes are contiguous along
++        // F). For best coalescing the work-group should sit on that axis. But
++        // GetOptimalLocalWorkGroupSizes uses a bfyx priority of x->y->f and
++        // greedily puts the LWS on the Y axis first; when Y is a small or
++        // awkwardly-divisible (often dynamic) sequence length, it picks a tiny LWS
++        // on Y and leaves only 1 work-item along F, so the writes are scattered
++        // instead of coalesced. For a transpose with a large F axis and a small,
++        // poorly-divisible Y (e.g. a [1,C,S]->[1,S,C] post-conv transpose) this is
++        // substantially slower than an lws={1,1,WG} dispatch on the coalesced F
++        // axis. Force that dispatch, but only in the pathological shape (large F
++        // axis, tiny LWS landed on F) so permutes the allocator already handles
++        // well are never regressed. This is a pure local-work-group choice and
++        // changes no indexing or arithmetic, so the result is numerically identical.
++        const size_t gws_y = dispatchData.gws[1];
++        const size_t gws_f = dispatchData.gws[2];
++        const size_t cur_total_lws = dispatchData.lws[0] * dispatchData.lws[1] * dispatchData.lws[2];
++        const size_t max_wg = params.engineInfo.maxWorkGroupSize ? params.engineInfo.maxWorkGroupSize : 256;
++        if (gws_f >= gws_y && gws_f >= 256) {
++            size_t lws_f = 1;
++            for (size_t cand = std::min<size_t>(max_wg, gws_f); cand >= 1; --cand) {
++                if (gws_f % cand == 0) { lws_f = cand; break; }
++            }
++            // Only override when concentrating the work-group on the coalesced F
++            // axis yields a work-group at least as large as the allocator's pick
++            // (never shrink occupancy) and actually moves more lanes onto F.
++            if (lws_f >= cur_total_lws && lws_f > dispatchData.lws[2]) {
++                dispatchData.lws = {1, 1, lws_f};
++            }
++        }
+     }
+ 
+     return dispatchData;

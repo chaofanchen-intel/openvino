@@ -1,0 +1,531 @@
+From e16c4185ce6e8c9edc71c5b0bb77571dca5e78ae Mon Sep 17 00:00:00 2001
+From: qwen35 <qwen35@local>
+Date: Tue, 27 Oct 2026 03:09:07 +0800
+Subject: [PATCH 1/4] [GPU] Fuse the Gated-DeltaNet SiLUs into their producers
+
+Qwen3.5's linear-attention block applies SiLU in two places and both end up as a
+standalone activation kernel that re-reads and re-writes the whole tensor:
+
+  PagedCausalConv1D -> Reshape -> Swish   ([tokens, 6144], ~13 ms / 1k-token prefill)
+  in_proj_z FC      -> Reshape -> Swish   ([tokens, 2048],  ~4 ms)
+
+prepare_primitive_fusing only looks at a node's direct dependency, and the Reshape
+that PagedCausalConv1DFusion/FC leave in between blocks the fusion. ov::pass::
+MoveEltwiseUpThroughDataMov does not match ov::op::v4::Swish (it derives from Op).
+
+* New pass MoveSwishUpThroughReshape: Swish(Reshape(x)) -> Reshape(Swish(x)) for a
+  single-consumer Reshape (value-identical).
+* prepare_primitive_fusing: allow a swish activation to fuse into paged_causal_conv1d.
+* paged_causal_conv1d_ref: SWISH epilogue with the rounding order of the stand-alone
+  activation kernel (round to f16 first, then SiLU in f16). The stand-alone kernel
+  evaluates exp() on a half4, the epilogue on a scalar half, so the last f16 bit can
+  differ: the first token was identical in the original study, a long greedy decode is
+  not guaranteed to be.
+* The in_proj_z Swish becomes the existing oneDNN eltwise_swish FC post-op. This one is
+  evaluated on the f32 accumulator (more accurate, not bit-identical).
+
+Switches: OV_DISABLE_SWISH_HOIST=1 turns the pass off; OV_SWISH_HOIST_PRODUCER_ONLY=1
+hoists only over PagedCausalConv1D and leaves the in_proj_z SiLU as a separate kernel.
+CMake: the plugin glob gets CONFIGURE_DEPENDS so an existing build tree picks up the
+new source file.
+---
+ src/plugins/intel_gpu/CMakeLists.txt          |  2 +-
+ .../prepare_primitive_fusing.cpp              | 11 +++
+ .../impls/ocl_v2/paged_causal_conv1d_ref.cl   | 29 ++++++-
+ .../impls/ocl_v2/paged_causal_conv1d_ref.cpp  | 15 ++++
+ .../move_swish_up_through_reshape.cpp         | 76 ++++++++++++++++++
+ .../move_swish_up_through_reshape.hpp         | 35 ++++++++
+ .../src/plugin/transformations_pipeline.cpp   | 10 +++
+ .../unit/test_cases/paged_causal_conv1d.cpp   | 44 +++++++++--
+ .../move_swish_up_through_reshape_test.cpp    | 79 +++++++++++++++++++
+ 9 files changed, 292 insertions(+), 9 deletions(-)
+ create mode 100644 src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp
+ create mode 100644 src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp
+ create mode 100644 src/plugins/intel_gpu/tests/unit/transformations/move_swish_up_through_reshape_test.cpp
+
+diff --git a/src/plugins/intel_gpu/CMakeLists.txt b/src/plugins/intel_gpu/CMakeLists.txt
+index 5560e29..ae09670 100644
+--- a/src/plugins/intel_gpu/CMakeLists.txt
++++ b/src/plugins/intel_gpu/CMakeLists.txt
+@@ -132,7 +132,7 @@ add_subdirectory(src/runtime)
+ add_subdirectory(src/kernel_selector)
+ add_subdirectory(src/graph)
+ 
+-file(GLOB_RECURSE PLUGIN_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/include/intel_gpu/plugin/*.hpp)
++file(GLOB_RECURSE PLUGIN_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/include/intel_gpu/plugin/*.hpp)
+ 
+ ov_add_plugin(NAME ${TARGET_NAME}
+               DEVICE_NAME "GPU"
+diff --git a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+index ca4875c..cbbd34c 100644
+--- a/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
++++ b/src/plugins/intel_gpu/src/graph/graph_optimizer/prepare_primitive_fusing.cpp
+@@ -45,6 +45,7 @@
+ #include "group_normalization_inst.h"
+ #include "lora_inst.h"
+ #include "broadcast_inst.h"
++#include "paged_causal_conv1d_inst.h"
+ #include <vector>
+ #include <map>
+ #include <list>
+@@ -840,6 +841,16 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
+ 
+             should_fuse |= input.is_type<rms>();
+ 
++            // Qwen3.5 / Gated-DeltaNet: PagedCausalConv1D is always followed by SiLU
++            // (aten::silu -> Swish), and PagedCausalConv1DFusion deliberately ends its
++            // pattern at the Slice, so the activation stays a standalone node. On a
++            // bandwidth-limited iGPU that standalone pass is pure overhead: it re-reads
++            // and re-writes the whole [tokens, hidden] conv output (~24 MB per layer for
++            // a 1k-token prefill) at a point where the conv kernel still holds the value
++            // in a register. The conv1d kernel only implements SWISH, so the fusion is
++            // restricted to exactly that.
++            should_fuse |= input.is_type<paged_causal_conv1d>() && activation_func == cldnn::activation_func::swish;
++
+             should_fuse |= input.is_type<group_normalization>();
+ 
+             should_fuse |= input.is_type<normalize>() && data_type_traits::is_i8_u8(input.get_input_layout(0).data_type);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
+index dbb8346..a351a1b 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cl
+@@ -4,6 +4,33 @@
+ 
+ #include "include/batch_headers/common.cl"
+ 
++// Optional fused SWISH (SiLU) epilogue.
++//
++// Qwen3.5 / Gated-DeltaNet always applies SiLU to this conv's output, and
++// prepare_primitive_fusing folds that Swish node into this primitive. Doing it here
++// removes a standalone elementwise pass that would otherwise re-read and re-write the
++// entire [tokens, hidden] output -- on a bandwidth-limited iGPU that pass costs about as
++// much as the convolution itself, since it moves ~24 MB per layer for a 1k-token prefill
++// and already runs at the device's memory-bandwidth ceiling.
++//
++// The rounding sequence is deliberately identical to the un-fused graph: the standalone
++// activation_opt kernel reads the f16 conv output and evaluates SWISH in the OUTPUT type
++// (jitter emits `x / (1 + exp(-(beta*x)))` in OUTPUT_TYPE), so `sum` is rounded to
++// OUTPUT_TYPE FIRST and the SiLU is then evaluated in that same type. Applying SiLU to the
++// f32 accumulator would be slightly more accurate but would NOT follow the un-fused
++// rounding. One difference remains: the standalone kernel evaluates exp() on a half4
++// vector, this epilogue on a scalar half, which can differ in the last f16 bit.
++#if FUSE_SWISH
++    #define APPLY_CONV1D_EPILOGUE(acc)                                       \
++        ({                                                                   \
++            OUTPUT_TYPE _v = TO_OUTPUT_TYPE(acc);                            \
++            _v / (TO_OUTPUT_TYPE(1.0f) +                                     \
++                  exp(-(TO_OUTPUT_TYPE(FUSE_SWISH_BETA) * _v)));             \
++        })
++#else
++    #define APPLY_CONV1D_EPILOGUE(acc) TO_OUTPUT_TYPE(acc)
++#endif
++
+ KERNEL(paged_causal_conv1d_ref)
+ (__global INPUT0_TYPE* input_embeds,
+  __global INPUT1_TYPE* conv_state_table,
+@@ -115,7 +142,7 @@ KERNEL(paged_causal_conv1d_ref)
+         }
+ 
+         const int out_off = token_idx * output_token_stride + h * output_hidden_stride;
+-        output_embeds[out_off] = TO_OUTPUT_TYPE(sum);
++        output_embeds[out_off] = APPLY_CONV1D_EPILOGUE(sum);
+ 
+         const int cached_tokens = prev_nums + (t + 1);
+         const int interval_hit = (seq_interval > 0) && ((cached_tokens % seq_interval) == 0);
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
+index 182d15b..10d123a 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_causal_conv1d_ref.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <limits>
+ 
++#include "intel_gpu/primitives/activation.hpp"
+ #include "intel_gpu/primitives/paged_causal_conv1d.hpp"
+ #include "primitive_ocl_base.hpp"
+ #include "utils/kernel_generator.hpp"
+@@ -59,6 +60,20 @@ protected:
+         jit.make("KERNEL_SIZE", static_cast<int>(state_shape[2].get_length()));
+         jit.make("HAS_BIAS", has_bias ? 1 : 0);
+ 
++        // A SWISH activation fused by prepare_primitive_fusing (Qwen3.5 / Gated-DeltaNet
++        // applies SiLU to the conv output). Applying it in the conv epilogue removes a
++        // full read+write pass over the [tokens, hidden] output. Only the single-SWISH
++        // case is accepted here, matching the guard in prepare_primitive_fusing; anything
++        // else leaves the activation as its own node, so an unhandled fusion can never be
++        // silently dropped.
++        if (params.has_fused_primitives() && params.fused_desc.size() == 1 && params.fused_desc[0].is_type<cldnn::activation>()) {
++            const auto act = params.fused_desc[0].typed_desc<cldnn::activation>();
++            if (act->activation_function == cldnn::activation_func::swish) {
++                jit.make("FUSE_SWISH", 1);
++                jit.make("FUSE_SWISH_BETA", act->additional_params.a);
++            }
++        }
++
+         return jit;
+     }
+ 
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp
+new file mode 100644
+index 0000000..fababca
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.cpp
+@@ -0,0 +1,76 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include "move_swish_up_through_reshape.hpp"
++
++#include "openvino/core/graph_util.hpp"
++#include "openvino/core/rt_info.hpp"
++#include "openvino/op/reshape.hpp"
++#include "openvino/op/swish.hpp"
++#include "openvino/pass/pattern/op/wrap_type.hpp"
++#include "transformations/utils/utils.hpp"
++
++namespace ov::intel_gpu {
++
++MoveSwishUpThroughReshape::MoveSwishUpThroughReshape() {
++    using namespace ov::pass::pattern;
++
++    auto reshape_m = wrap_type<ov::op::v1::Reshape>(consumers_count(1));
++    auto swish_m = wrap_type<ov::op::v4::Swish>({reshape_m, any_input()});
++    auto swish_no_beta_m = wrap_type<ov::op::v4::Swish>({reshape_m});
++    auto root_m = std::make_shared<ov::pass::pattern::op::Or>(ov::OutputVector{swish_m, swish_no_beta_m});
++
++    matcher_pass_callback callback = [=](Matcher& m) {
++        const auto& pattern_map = m.get_pattern_value_map();
++        auto swish = ov::as_type_ptr<ov::op::v4::Swish>(m.get_match_root());
++        auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(pattern_map.at(reshape_m).get_node_shared_ptr());
++        if (!swish || !reshape) {
++            return false;
++        }
++
++        // consumers_count(1) already guarantees the Reshape feeds only this Swish, so no
++        // other consumer can observe the pre-activation values.
++        if (transformation_callback(swish)) {
++            return false;
++        }
++
++        // Hoisting over a PagedCausalConv1D producer lands the Swish in the conv's OCL epilogue,
++        // which reproduces the un-fused rounding exactly (round to f16, then SiLU in f16).
++        //
++        // Hoisting over a FullyConnected producer (the `in_proj_z` gate) instead turns the
++        // Swish into a oneDNN eltwise_swish post-op evaluated on the f32 GEMM accumulator. That
++        // is MORE accurate than the f16 standalone kernel but not bit-identical; it removes the
++        // last standalone SiLU pass (~3.6 ms of a 1k-token 2B prefill on Pantherlake) and is
++        // enabled by default here. OV_SWISH_HOIST_PRODUCER_ONLY=1 restores the conv-only behaviour.
++        const bool hoist_all = std::getenv("OV_SWISH_HOIST_PRODUCER_ONLY") == nullptr;
++        if (!hoist_all) {
++            const auto producer = reshape->input_value(0).get_node_shared_ptr();
++            if (producer->get_type_info().name != std::string("PagedCausalConv1D")) {
++                return false;
++            }
++        }
++
++        // Rebuild as Reshape(Swish(x)). The Swish takes the Reshape's data input; its beta
++        // input, when present, is a scalar and is carried over untouched.
++        ov::OutputVector swish_inputs{reshape->input_value(0)};
++        if (swish->get_input_size() > 1) {
++            swish_inputs.push_back(swish->input_value(1));
++        }
++        auto new_swish = swish->clone_with_new_inputs(swish_inputs);
++        new_swish->set_friendly_name(swish->get_friendly_name() + "_hoisted");
++
++        auto new_reshape = reshape->clone_with_new_inputs({new_swish, reshape->input_value(1)});
++        new_reshape->set_friendly_name(swish->get_friendly_name());
++
++        ov::copy_runtime_info({reshape, swish}, {new_swish, new_reshape});
++        ov::replace_node(swish, new_reshape);
++
++        return true;
++    };
++
++    auto m = std::make_shared<Matcher>(root_m, "MoveSwishUpThroughReshape");
++    this->register_matcher(m, callback);
++}
++
++}  // namespace ov::intel_gpu
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp
+new file mode 100644
+index 0000000..c6677f7
+--- /dev/null
++++ b/src/plugins/intel_gpu/src/plugin/transformations/move_swish_up_through_reshape.hpp
+@@ -0,0 +1,35 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#pragma once
++
++#include "openvino/pass/matcher_pass.hpp"
++
++namespace ov::intel_gpu {
++
++/// \brief Hoists a Swish (SiLU) above a single-consumer Reshape.
++///
++/// Rewrites `Swish(Reshape(x))` into `Reshape(Swish(x))`. Swish is elementwise and a
++/// Reshape only re-indexes, so this is value-for-value identical -- it changes nothing
++/// numerically, only which node the activation is adjacent to.
++///
++/// Motivation: in Qwen3.5 / Gated-DeltaNet the SiLU that follows the causal conv is
++/// separated from its producer by a Reshape that PagedCausalConv1DFusion inserts to
++/// restore the 3D shape. The same shape holds for the `in_proj_z` gate. The GPU plugin's
++/// prepare_primitive_fusing only fuses an activation into its *direct* dependency, so that
++/// interposed Reshape is what keeps the SiLU as a standalone kernel -- one that re-reads
++/// and re-writes the whole activation tensor at the device's memory-bandwidth ceiling.
++/// Hoisting the Swish makes it adjacent to the conv / FullyConnected again so the existing
++/// fusing pass can absorb it.
++///
++/// ov::pass::MoveEltwiseUpThroughDataMov does not cover this: it matches
++/// UnaryElementwiseArithmetic / BinaryElementwiseArithmetic, and ov::op::v4::Swish derives
++/// from ov::op::Op directly (it takes an optional beta input), so it is never matched.
++class MoveSwishUpThroughReshape : public ov::pass::MatcherPass {
++public:
++    OPENVINO_MATCHER_PASS_RTTI("MoveSwishUpThroughReshape");
++    MoveSwishUpThroughReshape();
++};
++
++}  // namespace ov::intel_gpu
+diff --git a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+index 53f683c..05d40be 100644
+--- a/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
++++ b/src/plugins/intel_gpu/src/plugin/transformations_pipeline.cpp
+@@ -115,6 +115,7 @@
+ #include "plugin/transformations/print_model_statistics.hpp"
+ #include "plugin/transformations/reduce_fc_dimensions.hpp"
+ #include "plugin/transformations/sink_reshape.hpp"
++#include "plugin/transformations/move_swish_up_through_reshape.hpp"
+ #include "plugin/transformations/transpose_fusion.hpp"
+ #include "plugin/transformations/sdpa_transpose_fusion.hpp"
+ #include "plugin/transformations/unsqueeze_broadcast_reshape_matmul_fusion.hpp"
+@@ -1693,6 +1694,15 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
+ 
+         manager.register_pass<ov::intel_gpu::SinkReshape>();
+ 
++        // Must run after the reshape-shuffling passes above, so a Swish is hoisted past
++        // whatever Reshape ends up adjacent to it and lands next to its real producer
++        // (PagedCausalConv1D / FullyConnected) in time for prepare_primitive_fusing.
++        // OV_DISABLE_SWISH_HOIST=1 restores the un-hoisted graph, which is what makes an
++        // interleaved A/B possible without swapping binaries.
++        if (std::getenv("OV_DISABLE_SWISH_HOIST") == nullptr) {
++            manager.register_pass<ov::intel_gpu::MoveSwishUpThroughReshape>();
++        }
++
+         if (device_info.supports_immad && config.get_use_onednn()) {
+             const bool asymmetric_dyn_quant = config.get_asym_dynamic_quantization();
+             auto dynamic_quantization_group_size = config.get_dynamic_quantization_group_size();
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_causal_conv1d.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/paged_causal_conv1d.cpp
+index 2f8613f..10632b5 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_causal_conv1d.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_causal_conv1d.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <intel_gpu/primitives/activation.hpp>
+ #include <intel_gpu/primitives/input_layout.hpp>
+ #include <intel_gpu/primitives/paged_causal_conv1d.hpp>
+ #include <vector>
+@@ -27,6 +28,8 @@ struct paged_causal_conv1d_test_params {
+     bool with_bias;
+     bool is_caching_test = false;
+     bool padded_input = false;
++    // Append a Swish (SiLU) after the convolution; prepare_primitive_fusing folds it into the kernel epilogue.
++    bool fuse_swish = false;
+ };
+ 
+ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_causal_conv1d_test_params> {
+@@ -200,7 +203,8 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                              layout block_idx_begins_data_layout,
+                              layout past_lens_data_layout,
+                              layout cache_interval_data_layout,
+-                             data_types output_dt) {
++                             data_types output_dt,
++                             bool fuse_swish) {
+         topology topo;
+ 
+         topo.add(input_layout("input_embeds", input_data_layout));
+@@ -224,7 +228,12 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                                       input_info("past_lens"),
+                                       input_info("cache_interval")}));
+ 
+-        topo.add(reorder("output", input_info("paged_causal_conv1d"), format::bfyx, output_dt));
++        if (fuse_swish) {
++            topo.add(activation("swish_act", input_info("paged_causal_conv1d"), activation_func::swish, {1.0f, 0.0f}));
++            topo.add(reorder("output", input_info("swish_act"), format::bfyx, output_dt));
++        } else {
++            topo.add(reorder("output", input_info("paged_causal_conv1d"), format::bfyx, output_dt));
++        }
+         return topo;
+     }
+ 
+@@ -238,11 +247,14 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                                                                     cldnn::memory::ptr block_idx_begins_mem,
+                                                                     cldnn::memory::ptr past_lens_mem,
+                                                                     cldnn::memory::ptr cache_interval_mem,
+-                                                                    bool is_caching_test) {
++                                                                    bool is_caching_test,
++                                                                    bool optimize_data) {
+         auto& engine = get_test_engine();
+ 
+         ExecutionConfig config = get_test_default_config(engine);
+         config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
++        // The activation is folded into the convolution by prepare_primitive_fusing, which only runs with optimize_data.
++        config.set_property(ov::intel_gpu::optimize_data(optimize_data));
+ 
+         cldnn::network::ptr net = get_network(engine, topo, config, get_test_stream_ptr(), is_caching_test);
+ 
+@@ -313,6 +325,14 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                       p.kernel_size,
+                       ref_output);
+ 
++        if (p.fuse_swish) {
++            // The kernel rounds the convolution to T first and evaluates SiLU in T, like the stand-alone activation.
++            for (auto& v : ref_output) {
++                const float x = static_cast<float>(v);
++                v = to_data_type<T>(x / (1.0f + std::exp(-x)));
++            }
++        }
++
+         if (p.padded_input)
+             load_padded_input(input_mem, input_embeds, p.tokens, p.hidden_size);
+         else
+@@ -337,7 +357,8 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                                     block_idx_begins_layout,
+                                     past_lens_layout,
+                                     cache_interval_layout,
+-                                    data_type);
++                                    data_type,
++                                    p.fuse_swish);
+ 
+         auto [out_mem, net] = run_network(topo,
+                                           input_mem,
+@@ -349,10 +370,16 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+                                           block_idx_begins_mem,
+                                           past_lens_mem,
+                                           cache_interval_mem,
+-                                          p.is_caching_test);
++                                          p.is_caching_test,
++                                          p.fuse_swish);
+ 
+         ASSERT_TRUE(out_mem != nullptr);
+         ASSERT_EQ(out_mem->count(), ref_output.size());
++        if (p.fuse_swish && !p.is_caching_test) {
++            const auto executed = net->get_executed_primitive_ids();
++            EXPECT_TRUE(std::find(executed.begin(), executed.end(), "swish_act") == executed.end())
++                << "the Swish was expected to be fused into paged_causal_conv1d";
++        }
+ 
+         {
+             cldnn::mem_lock<T, mem_lock_type::read> out_data(out_mem, get_test_stream());
+@@ -390,7 +417,7 @@ struct paged_causal_conv1d_gpu_test : public ::testing::TestWithParam<paged_caus
+         const auto& p = info.param;
+         return "paged_causal_conv1d_gpu_test_" + p.precision.to_string() + "_tokens_" + std::to_string(p.tokens) + "_seq_" + std::to_string(p.num_sequences) +
+                "_hidden_" + std::to_string(p.hidden_size) + "_kernel_" + std::to_string(p.kernel_size) + (p.with_bias ? "_bias" : "_no_bias") +
+-               (p.is_caching_test ? "_cached" : "") + (p.padded_input ? "_padded_input" : "");
++               (p.is_caching_test ? "_cached" : "") + (p.padded_input ? "_padded_input" : "") + (p.fuse_swish ? "_swish" : "");
+     }
+ };
+ 
+@@ -409,7 +436,10 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_causal_conv1d_gpu_test,
+                                            paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f32, false},
+                                            paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f16, true, true},
+                                            paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f32, true, false, true},
+-                                           paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f16, true, false, true}),
++                                           paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f16, true, false, true},
++                                           paged_causal_conv1d_test_params{12, 3, 32, 5, ov::element::f16, true, false, false, true},
++                                           paged_causal_conv1d_test_params{12, 3, 32, 5, ov::element::f32, true, false, false, true},
++                                           paged_causal_conv1d_test_params{8, 2, 16, 4, ov::element::f16, false, false, false, true}),
+                          paged_causal_conv1d_gpu_test::PrintToStringParamName);
+ 
+ }  // namespace
+diff --git a/src/plugins/intel_gpu/tests/unit/transformations/move_swish_up_through_reshape_test.cpp b/src/plugins/intel_gpu/tests/unit/transformations/move_swish_up_through_reshape_test.cpp
+new file mode 100644
+index 0000000..e5a1c1e
+--- /dev/null
++++ b/src/plugins/intel_gpu/tests/unit/transformations/move_swish_up_through_reshape_test.cpp
+@@ -0,0 +1,79 @@
++// Copyright (C) 2018-2026 Intel Corporation
++// SPDX-License-Identifier: Apache-2.0
++//
++
++#include <gtest/gtest.h>
++
++#include <memory>
++
++#include "common_test_utils/ov_test_utils.hpp"
++#include "openvino/core/model.hpp"
++#include "openvino/op/abs.hpp"
++#include "openvino/op/constant.hpp"
++#include "openvino/op/parameter.hpp"
++#include "openvino/op/reshape.hpp"
++#include "openvino/op/result.hpp"
++#include "openvino/op/swish.hpp"
++#include "openvino/pass/manager.hpp"
++#include "plugin/transformations/move_swish_up_through_reshape.hpp"
++
++using namespace testing;
++using namespace ov::intel_gpu;
++
++namespace {
++std::shared_ptr<ov::op::v1::Reshape> make_reshape(const ov::Output<ov::Node>& in) {
++    auto shape = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{3}, {1, -1, 128});
++    return std::make_shared<ov::op::v1::Reshape>(in, shape, false);
++}
++}  // namespace
++
++// Swish(Reshape(x)) -> Reshape(Swish(x)) when the Reshape feeds only the Swish.
++TEST_F(TransformationTestsF, MoveSwishUpThroughReshape) {
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto swish = std::make_shared<ov::op::v4::Swish>(make_reshape(x));
++        model = std::make_shared<ov::Model>(ov::OutputVector{swish}, ov::ParameterVector{x});
++        manager.register_pass<MoveSwishUpThroughReshape>();
++    }
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto swish = std::make_shared<ov::op::v4::Swish>(x);
++        model_ref = std::make_shared<ov::Model>(ov::OutputVector{make_reshape(swish)}, ov::ParameterVector{x});
++    }
++}
++
++// The optional beta input is carried over.
++TEST_F(TransformationTestsF, MoveSwishUpThroughReshapeWithBeta) {
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto beta = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{}, {1.5f});
++        auto swish = std::make_shared<ov::op::v4::Swish>(make_reshape(x), beta);
++        model = std::make_shared<ov::Model>(ov::OutputVector{swish}, ov::ParameterVector{x});
++        manager.register_pass<MoveSwishUpThroughReshape>();
++    }
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto beta = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{}, {1.5f});
++        auto swish = std::make_shared<ov::op::v4::Swish>(x, beta);
++        model_ref = std::make_shared<ov::Model>(ov::OutputVector{make_reshape(swish)}, ov::ParameterVector{x});
++    }
++}
++
++// A Reshape with a second consumer would expose the un-activated values: nothing may change.
++TEST_F(TransformationTestsF, MoveSwishUpThroughReshapeSharedReshapeUntouched) {
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto reshape = make_reshape(x);
++        auto swish = std::make_shared<ov::op::v4::Swish>(reshape);
++        auto other = std::make_shared<ov::op::v0::Abs>(reshape);
++        model = std::make_shared<ov::Model>(ov::OutputVector{swish, other}, ov::ParameterVector{x});
++        manager.register_pass<MoveSwishUpThroughReshape>();
++    }
++    {
++        auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::PartialShape{-1, 2048});
++        auto reshape = make_reshape(x);
++        auto swish = std::make_shared<ov::op::v4::Swish>(reshape);
++        auto other = std::make_shared<ov::op::v0::Abs>(reshape);
++        model_ref = std::make_shared<ov::Model>(ov::OutputVector{swish, other}, ov::ParameterVector{x});
++    }
++}
+-- 
+2.43.0
+

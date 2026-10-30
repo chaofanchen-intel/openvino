@@ -1,0 +1,330 @@
+From 2ac6dc79086fb74445d644a2f4200aabd7728168 Mon Sep 17 00:00:00 2001
+From: qwen35 <qwen35@local>
+Date: Tue, 27 Oct 2026 03:09:07 +0800
+Subject: [PATCH 3/4] [GPU] Work-group cooperative scaled-state
+ PagedGatedDeltaNet prefill kernel
+
+The gated-delta-rule recurrence in paged_gated_delta_net_opt is instruction-issue bound
+(XVE 77% active, ~315 instructions per thread and token, ~12 GB/s of DRAM traffic): every
+sub-group redundantly loads/L2-normalises q and k and computes exp(gate) and beta for each
+token, and the decay multiplies the whole state every token.
+
+For multi-token prefill (Xe2/Xe3, sub-group 16, K head dim 128, float8 vectors) a new
+fast path is used:
+
+* one work-group per (sequence, value head) with V_HEAD_DIM / 8 sub-groups, each owning 8
+  rows of the [V_HEAD_DIM x K_HEAD_DIM] state;
+* the state-independent per-token work (q/k load and L2 norm, q.k, exp(gate), beta) is done
+  once per work-group, GDN_CHUNK = 4 tokens at a time by different sub-groups, and handed to
+  the others through a double-buffered SLM tile;
+* the state is kept as S_true = c * S with a scalar c, so the decay only updates c, and
+  the delta rule is rearranged so that both dot products use the old state
+  (a = S.k, b = S.q, u = (v - c'a) * beta, S += (u / c') k, out = c' b + u (k.q));
+  S is renormalised when c' leaves [1e-6, 1e6] and before it is written back.
+
+Decode (1 token) and shapes that do not fit keep the original kernel.
+
+Unit tests: seven new paged_gated_delta_net cases (long sequences, several chunks, tails
+that are not a multiple of the chunk, f16/f32). The f16 cases use gate <= 0 because gate in
+[-1, 1] makes the state grow and fails the original kernel too.
+---
+ .../impls/ocl_v2/paged_gated_delta_net.cpp    |  39 ++++-
+ .../impls/ocl_v2/paged_gated_delta_net_opt.cl | 144 ++++++++++++++++++
+ .../unit/test_cases/paged_gated_delta_net.cpp |  19 ++-
+ 3 files changed, 194 insertions(+), 8 deletions(-)
+
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
+index b4805fd..f8697b6 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net.cpp
+@@ -13,9 +13,15 @@
+ namespace ov::intel_gpu::ocl {
+ namespace {
+ 
+-size_t get_v_block_size(size_t v_head_dims) {
++// Work-group cooperative kernel body (see paged_gated_delta_net_opt.cl, GDN_FAST_PATH): V_HEAD_DIM / V_BLOCK_SIZE sub-groups
++// share one (sequence, head) work-group. It needs at least GDN_CHUNK (4) sub-groups and one float8 of K per lane.
++constexpr size_t gdn_coop_v_block_size = 8;
++constexpr size_t gdn_coop_chunk = 4;
++constexpr size_t gdn_coop_slm_bytes = 2 * gdn_coop_chunk * (2 * 128 + 16) * sizeof(float);
++
++size_t get_v_block_size(size_t v_head_dims, bool coop) {
+     // v_block_size is determined by GRF size and performance data
+-    return 4;
++    return coop ? gdn_coop_v_block_size : 4;
+ }
+ 
+ size_t get_subgroup_size(gpu_arch arch) {
+@@ -33,6 +39,24 @@ size_t get_subgroup_size(gpu_arch arch) {
+     }
+ }
+ 
++size_t get_vec_size(const RuntimeParams& params);
++
++bool use_wg_coop(const RuntimeParams& params, bool force_ref_path) {
++    if (force_ref_path)
++        return false;
++    const auto& q_shape = params.get_input_layout(paged_gated_delta_net::QUERY).get_partial_shape();
++    const auto& v_shape = params.get_input_layout(paged_gated_delta_net::VALUE).get_partial_shape();
++    const size_t k_head_dims = q_shape[2].get_length();
++    const size_t v_head_dims = v_shape[2].get_length();
++    const size_t subgroup_size = get_subgroup_size(params.get_device_info().arch);
++    if (subgroup_size != 16 || k_head_dims != subgroup_size * 8 || get_vec_size(params) != 8)
++        return false;
++    if (v_head_dims % gdn_coop_v_block_size != 0 || (v_head_dims / gdn_coop_v_block_size) < gdn_coop_chunk)
++        return false;
++    const auto& info = params.get_device_info();
++    return v_head_dims / gdn_coop_v_block_size * subgroup_size <= info.max_work_group_size && gdn_coop_slm_bytes <= info.max_local_mem_size;
++}
++
+ size_t get_vec_size(const RuntimeParams& params) {
+     const auto& q_layout = params.get_input_layout(paged_gated_delta_net::QUERY);
+     const auto& q_shape = q_layout.get_partial_shape();
+@@ -90,7 +114,9 @@ protected:
+         jit.make("V_HEAD_NUM", v_head_nums);
+         jit.make("K_HEAD_DIM", k_head_dims);
+         jit.make("V_HEAD_DIM", v_head_dims);
+-        jit.make("V_BLOCK_SIZE", get_v_block_size(v_head_dims));
++        const bool coop = use_wg_coop(params, m_force_ref_path);
++        jit.make("V_BLOCK_SIZE", get_v_block_size(v_head_dims, coop));
++        jit.make("GDN_FAST_PATH", coop ? 1 : 0);
+         jit.make("SUBGROUP_SIZE", get_subgroup_size(params.get_device_info().arch));
+         jit.make("K_VEC_SIZE", m_force_ref_path ? 1 : get_vec_size(params));
+         jit.make("FUSE_QK_L2NORM", desc->use_qk_l2norm ? 1 : 0);
+@@ -118,7 +144,7 @@ protected:
+     }
+ 
+     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
+-        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
++        return DispatchDataFunc{[force_ref = m_force_ref_path](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+             assert(!params.is_dynamic());
+             auto& wgs = kd.params.workGroups;
+             const auto& v_shape = params.get_input_layout(paged_gated_delta_net::VALUE).get_partial_shape();
+@@ -127,7 +153,8 @@ protected:
+             const size_t sequences = seq_shape[0].get_length() > 0 ? seq_shape[0].get_length() - 1 : 0;
+             const size_t head_nums = v_shape[1].get_length();
+             const size_t v_head_dims = v_shape[2].get_length();
+-            const size_t current_v_block_size = get_v_block_size(v_head_dims);
++            const bool coop = use_wg_coop(params, force_ref);
++            const size_t current_v_block_size = get_v_block_size(v_head_dims, coop);
+             const size_t v_blocks = (v_head_dims + current_v_block_size - 1) / current_v_block_size;
+             const size_t subgroup_size = get_subgroup_size(params.get_device_info().arch);
+ 
+@@ -158,7 +185,7 @@ protected:
+             const int32_t value_head_offset = static_cast<int32_t>(get_head_offset(v_layout, 1));
+ 
+             wgs.global = {sequences, head_nums, v_blocks * subgroup_size};
+-            wgs.local = {1, 1, subgroup_size};
++            wgs.local = {1, 1, coop ? v_blocks * subgroup_size : subgroup_size};
+ 
+             kd.params.scalars.clear();
+             std::vector<int32_t> scalars{
+diff --git a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
+index 1d48cff..0765c94 100644
+--- a/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
++++ b/src/plugins/intel_gpu/src/graph/impls/ocl_v2/paged_gated_delta_net_opt.cl
+@@ -43,6 +43,56 @@ inline void FUNC(normalize_kq_128)(float8* b_k, float8* b_q) {
+ #endif
+ }
+ 
++
++#ifndef GDN_RENORM_THRESHOLD
++#    define GDN_RENORM_THRESHOLD 1.0e-6f
++#endif
++
++#ifndef GDN_RENORM_UPPER
++#    define GDN_RENORM_UPPER 1.0e6f
++#endif
++
++// GDN_FAST_PATH (set by the host when K_HEAD_DIM == 8 * SUBGROUP_SIZE and the work-group of V_HEAD_DIM / V_BLOCK_SIZE
++// sub-groups is legal) selects the work-group cooperative kernel body below; otherwise the generic one is used.
++#ifndef GDN_FAST_PATH
++#    define GDN_FAST_PATH 0
++#endif
++#define GDN_CHUNK 4
++#define GDN_TOK_STRIDE (2 * K_HEAD_DIM + SUBGROUP_SIZE)
++#if FUSE_QK_L2NORM
++#    define GDN_FUSE_K_SCALE(sum) FUNC(l2norm_scale)((sum), 1.0f, K_L2_NORM_EPS)
++#    define GDN_FUSE_Q_SCALE(sum) FUNC(l2norm_scale)((sum), SCALE_FACTOR, Q_L2_NORM_EPS)
++#else
++#    define GDN_FUSE_K_SCALE(sum) 1.0f
++#    define GDN_FUSE_Q_SCALE(sum) SCALE_FACTOR
++#endif
++
++// Preprocess token (t_first + sg_id) of the current chunk (if it exists) into SLM buffer `bufi`:
++// L2-normalised q (scaled) and k as float, plus {k.q, exp(gate), beta}.
++#define GDN_PREPROCESS(t_first, seg_end_, bufi)                                                                          \
++    do {                                                                                                                 \
++        const int tk_ = (t_first) + sg_id;                                                                               \
++        if (sg_id < GDN_CHUNK && tk_ < (seg_end_)) {                                                                     \
++            float8 qr = convert_float8(BLOCK_READN(INPUT0_TYPE, 8, query, tk_ * q_token_stride + q_head_base));          \
++            float8 kr = convert_float8(BLOCK_READN(INPUT1_TYPE, 8, key, tk_ * k_token_stride + k_head_base));            \
++            float k_sum = FUNC(sum8)(kr * kr);                                                                           \
++            float q_sum = FUNC(sum8)(qr * qr);                                                                           \
++            float kq_sum = FUNC(sum8)(kr * qr);                                                                          \
++            k_sum = sub_group_reduce_add(k_sum);                                                                         \
++            q_sum = sub_group_reduce_add(q_sum);                                                                         \
++            kq_sum = sub_group_reduce_add(kq_sum);                                                                       \
++            const float k_scale_ = GDN_FUSE_K_SCALE(k_sum);                                                              \
++            const float q_scale_ = GDN_FUSE_Q_SCALE(q_sum);                                                              \
++            __local float* tb_ = gdn_slm + ((bufi) * GDN_CHUNK + sg_id) * GDN_TOK_STRIDE;                                \
++            BLOCK_WRITEN_SLM(float, 8, tb_, 0, qr * q_scale_);                                                           \
++            BLOCK_WRITEN_SLM(float, 8, tb_, K_HEAD_DIM, kr * k_scale_);                                                  \
++            const float g_ = exp(convert_float(gate[tk_ * V_HEAD_NUM + h]));                                             \
++            const float beta_ = convert_float(beta[tk_ * V_HEAD_NUM + h]);                                               \
++            const float m_ = lid == 0 ? kq_sum * k_scale_ * q_scale_ : (lid == 1 ? g_ : (lid == 2 ? beta_ : 0.0f));      \
++            BLOCK_WRITEN_SLM(float, 1, tb_, 2 * K_HEAD_DIM, m_);                                                         \
++        }                                                                                                                \
++    } while (0)
++
+ #ifndef K_VEC_SIZE
+ #    define K_VEC_SIZE 1
+ #endif
+@@ -123,6 +173,100 @@ KERNEL(paged_gated_delta_net_opt)
+     const int v_head_base = (h + value_head_offset) * v_head_stride;
+     const int state_stride = K_HEAD_DIM * V_HEAD_DIM;
+ 
++
++#if GDN_FAST_PATH
++    // ---- work-group cooperative fast path ----------------------------------------------------------------------------
++    // One work-group = one (sequence, head) and holds V_HEAD_DIM / V_BLOCK_SIZE sub-groups; each sub-group owns
++    // V_BLOCK_SIZE rows of the [V_HEAD_DIM x K_HEAD_DIM] state, one float8 per row and lane.
++    //  * The per-token, per-head work that does not depend on the state (q/k load + L2 norm, q.k, exp(gate), beta) is done
++    //    once per work-group, GDN_CHUNK tokens at a time by different sub-groups, and handed to the others through SLM.
++    //  * The state is kept as S_true = c * S with a scalar c, so the decay only touches c, and the delta rule is rearranged so
++    //    that both dot products use the old state:  a = S.k, b = S.q,  u = (v - c' a) * beta (c' = c g),
++    //    S += (u / c') k,  out = c' b + u (k.q).  S is renormalised (S *= c', c = 1) if c' leaves [GDN_RENORM_THRESHOLD, GDN_RENORM_UPPER].
++    __local float gdn_slm[2 * GDN_CHUNK * GDN_TOK_STRIDE];
++    const int sg_id = get_local_id(2) / SUBGROUP_SIZE;
++    const int sg_start_iv = sg_id * V_BLOCK_SIZE;
++    float8 S[V_BLOCK_SIZE];
++    {
++        const int base0 = (block_indices[block_begin] * V_HEAD_NUM + h) * state_stride;
++#    pragma unroll
++        for (int r = 0; r < V_BLOCK_SIZE; r++)
++            S[r] = convert_float8(BLOCK_READN(INPUT3_TYPE, 8, recurrent_state_table, base0 + (sg_start_iv + r) * K_HEAD_DIM));
++    }
++    float c_scale = 1.0f;
++
++    int token_f = token_begin;
++    int slot_f = 1;
++    int to_boundary_f = interval > 0 ? (prev_nums > 0 ? (interval - prev_nums) : interval) : (token_end - token_begin);
++    while (token_f < token_end) {
++        const int seg_end = min(token_f + to_boundary_f, token_end);
++
++        // prologue: preprocess the first chunk of the segment into buffer 0
++        GDN_PREPROCESS(token_f, seg_end, 0);
++        barrier(CLK_LOCAL_MEM_FENCE);
++
++        int buf = 0;
++        for (int t0 = token_f; t0 < seg_end; t0 += GDN_CHUNK) {
++            const int n_tok = min(GDN_CHUNK, seg_end - t0);
++            if (t0 + GDN_CHUNK < seg_end)
++                GDN_PREPROCESS(t0 + GDN_CHUNK, seg_end, buf ^ 1);
++
++            for (int j = 0; j < n_tok; j++) {
++                const int tk = t0 + j;
++                const __local float* tb = gdn_slm + (buf * GDN_CHUNK + j) * GDN_TOK_STRIDE;
++                const float8 qv = BLOCK_READN_SLM(float, 8, tb, 0);
++                const float8 kv = BLOCK_READN_SLM(float, 8, tb, K_HEAD_DIM);
++                const float misc = BLOCK_READN_SLM(float, 1, tb, 2 * K_HEAD_DIM);
++                const float kq = sub_group_broadcast(misc, 0);
++                const float b_g = sub_group_broadcast(misc, 1);
++                const float b_beta = sub_group_broadcast(misc, 2);
++
++                float c_new = c_scale * b_g;
++                if (c_new < GDN_RENORM_THRESHOLD || c_new > GDN_RENORM_UPPER) {
++#    pragma unroll
++                    for (int r = 0; r < V_BLOCK_SIZE; r++)
++                        S[r] *= c_new;
++                    c_new = 1.0f;
++                }
++                const float inv_c = 1.0f / c_new;
++
++                float a_part[V_BLOCK_SIZE];
++                float b_part[V_BLOCK_SIZE];
++#    pragma unroll
++                for (int r = 0; r < V_BLOCK_SIZE; r++) {
++                    a_part[r] = FUNC(sum8)(S[r] * kv);
++                    b_part[r] = FUNC(sum8)(S[r] * qv);
++                }
++                const float v_all = convert_float(BLOCK_READN(INPUT2_TYPE, 1, value, tk * v_token_stride + v_head_base + (sg_start_iv & ~(SUBGROUP_SIZE - 1))));
++                float out_sel = 0.0f;
++#    pragma unroll
++                for (int r = 0; r < V_BLOCK_SIZE; r++) {
++                    const float a = sub_group_reduce_add(a_part[r]);
++                    const float b = sub_group_reduce_add(b_part[r]);
++                    const float v_r = sub_group_broadcast(v_all, (sg_start_iv & (SUBGROUP_SIZE - 1)) + r);
++                    const float u = (v_r - c_new * a) * b_beta;
++                    S[r] = fma(kv, u * inv_c, S[r]);
++                    out_sel = (lid == r) ? (c_new * b + u * kq) : out_sel;
++                }
++                if (lid < V_BLOCK_SIZE)
++                    output[(tk * V_HEAD_NUM + h) * V_HEAD_DIM + sg_start_iv + lid] = TO_OUTPUT_TYPE(out_sel);
++                c_scale = c_new;
++            }
++            buf ^= 1;
++            barrier(CLK_LOCAL_MEM_FENCE);
++        }
++        token_f = seg_end;
++
++        const int block_base_f = (block_indices[block_begin + slot_f] * V_HEAD_NUM + h) * state_stride;
++        slot_f++;
++#    pragma unroll
++        for (int r = 0; r < V_BLOCK_SIZE; r++)
++            BLOCK_WRITEN(INPUT3_TYPE, 8, recurrent_state_table, block_base_f + (sg_start_iv + r) * K_HEAD_DIM, K_VEC_TO_STATE(S[r] * c_scale));
++        if (interval > 0)
++            to_boundary_f = interval;
++    }
++    return;
++#endif
+     K_VEC_TYPE state[V_BLOCK_SIZE][K_VEC_COUNT];
+     K_VEC_TYPE q_norm[K_VEC_COUNT];
+     K_VEC_TYPE k_norm[K_VEC_COUNT];
+diff --git a/src/plugins/intel_gpu/tests/unit/test_cases/paged_gated_delta_net.cpp b/src/plugins/intel_gpu/tests/unit/test_cases/paged_gated_delta_net.cpp
+index fb3771b..e93715e 100644
+--- a/src/plugins/intel_gpu/tests/unit/test_cases/paged_gated_delta_net.cpp
++++ b/src/plugins/intel_gpu/tests/unit/test_cases/paged_gated_delta_net.cpp
+@@ -28,6 +28,8 @@ struct paged_gated_delta_net_test_params {
+     int32_t head_size;                        // Per-head hidden size (K and V dims in this test)
+     ov::element::Type precision;              // Data precision for query/key/value/state tensors
+     bool is_caching_test = false;
++    float gate_lo = -1.0f;                    // Range of the random `gate` input (log of the per-token state decay)
++    float gate_hi = 1.0f;
+ };
+ 
+ struct paged_gated_delta_net_gpu_test : public ::testing::TestWithParam<paged_gated_delta_net_test_params> {
+@@ -250,7 +252,7 @@ struct paged_gated_delta_net_gpu_test : public ::testing::TestWithParam<paged_ga
+         auto query = rg.generate_random_1d<T>(q_mem->count(), -1, 1, 1024);
+         auto key = rg.generate_random_1d<T>(k_mem->count(), -1, 1, 256);
+         auto value = rg.generate_random_1d<T>(v_mem->count(), -1, 1, 256);
+-        auto gate = rg.generate_random_1d<T>(gate_mem->count(), -1, 1, 256);
++        auto gate = rg.generate_random_1d<T>(gate_mem->count(), p.gate_lo, p.gate_hi, 256);
+         auto beta = rg.generate_random_1d<T>(beta_mem->count(), 0, 1, 256);
+         auto state = rg.generate_random_1d<T>(state_mem->count(), -1, 1, 256);
+ 
+@@ -447,7 +449,20 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_gated_delta_net_gpu_test,
+                              paged_gated_delta_net_test_params{{16, 32, 48, 64}, {16, 32, 48, 64}, {16, 16, 16, 16}, 2, 2, 64, ov::element::f32},
+                              // partially occupied past blocks
+                              paged_gated_delta_net_test_params{{16, 32, 48, 64}, {1, 17, 33, 49}, {16, 16, 16, 16}, 2, 2, 64, ov::element::f32},
+-                             paged_gated_delta_net_test_params{{3, 3}, {2, 3}, {2, 3}, 2, 2, 16, ov::element::f16, true}),
++                             paged_gated_delta_net_test_params{{3, 3}, {2, 3}, {2, 3}, 2, 2, 16, ov::element::f16, true},
++
++                             // Long sequences that span many chunks of the work-group cooperative kernel (head_size 128),
++                             // with and without cache intervals, GQA (v_heads = 2 * qk_heads) and mixed past lengths.
++                             // The f16 cases use gate <= 0 (a decaying state, as in the model): with gate in [-1, 1] the state grows
++                             // exponentially and f16 rounding of the inputs alone decides the result, for any kernel.
++                             paged_gated_delta_net_test_params{{70, 33}, {0, 0}, {0, 0}, 2, 2, 128, ov::element::f16, false, -1.0f, 0.0f},
++                             paged_gated_delta_net_test_params{{70, 33}, {0, 0}, {0, 0}, 2, 2, 128, ov::element::f32},
++                             paged_gated_delta_net_test_params{{17, 40, 9}, {0, 5, 3}, {16, 0, 4}, 2, 4, 128, ov::element::f16, false, -1.0f, 0.0f},
++                             paged_gated_delta_net_test_params{{17, 40, 9}, {0, 5, 3}, {16, 0, 4}, 2, 4, 128, ov::element::f32},
++                             paged_gated_delta_net_test_params{{130, 5}, {7, 0}, {64, 0}, 2, 2, 128, ov::element::f16, false, -1.0f, 0.0f},
++                             // Strongly decaying state (gate << 0): exercises the scale renormalisation of the scaled-state kernel.
++                             paged_gated_delta_net_test_params{{90, 41}, {0, 0}, {0, 0}, 2, 2, 128, ov::element::f16, false, -9.0f, -3.0f},
++                             paged_gated_delta_net_test_params{{90, 41}, {0, 0}, {0, 0}, 2, 2, 128, ov::element::f32, false, -30.0f, -10.0f}),
+                          paged_gated_delta_net_gpu_test::PrintToStringParamName);
+ 
+ }  // namespace
+-- 
+2.43.0
+
